@@ -90,13 +90,21 @@ MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
 MODE_LABELS = {
     MODE_LVN_1: "Mode 1 - LVN Adaptive",
-    MODE_SCALP_M1_2: "Mode 2 - M1 Scalp Pullback",
+    MODE_SCALP_M1_2: "Mode 2 - M1 Scalp Multi-Strategy",
 }
 MODE_MAGIC_OFFSETS = {
     MODE_LVN_1: 11,
     MODE_SCALP_M1_2: 22,
 }
 DEFAULT_ACTIVE_MODES = [MODE_LVN_1, MODE_SCALP_M1_2]
+MODE2_STRATEGY_LABELS = {
+    "trend_pullback": "Trend Pullback",
+    "breakout": "Breakout",
+    "mean_reversion": "Mean Reversion",
+    "reversal_pa": "Reversal Price Action",
+    "orderflow_proxy": "Orderflow/CHOCH (proxy)",
+    "session_scalp": "Session-based scalp",
+}
 
 _today_mode_cache = {}
 
@@ -230,6 +238,13 @@ def normalize_mode_settings(cfg):
         if not isinstance(mcfg, dict):
             mcfg = {}
         mcfg.setdefault("enabled", mode in DEFAULT_ACTIVE_MODES)
+        if mode == MODE_SCALP_M1_2:
+            strat_cfg = mcfg.get("strategies", {})
+            if not isinstance(strat_cfg, dict):
+                strat_cfg = {}
+            for sid in MODE2_STRATEGY_LABELS:
+                strat_cfg.setdefault(sid, True)
+            mcfg["strategies"] = strat_cfg
         modes[mode] = mcfg
     cfg["modes"] = modes
     cfg["active_modes"] = [m for m in MODE_LABELS if modes.get(m, {}).get("enabled", False)]
@@ -379,15 +394,29 @@ def get_active_modes(cfg):
 
 
 def compute_mode2_m1_scalp_signal(cfg):
-    bars = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M1, 0, 500)
+    bars = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M1, 0, 700)
     if bars is None or len(bars) < 150:
         return None
     df = pd.DataFrame(bars).iloc[:-1].reset_index(drop=True)  # closed bars only
-    if len(df) < 120:
+    if len(df) < 220:
         return None
 
     atr_m1 = atr_series(df, 14)
     ema9 = df["close"].ewm(span=9, adjust=False).mean()
+    ema20_m1 = df["close"].ewm(span=20, adjust=False).mean()
+    ema50_m1 = df["close"].ewm(span=50, adjust=False).mean()
+    bb_mid = df["close"].rolling(20).mean()
+    bb_std = df["close"].rolling(20).std(ddof=0)
+    bb_up = bb_mid + 2.0 * bb_std
+    bb_dn = bb_mid - 2.0 * bb_std
+
+    tser = pd.to_datetime(df["time"], unit="s")
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    vol = df["tick_volume"].astype(float).clip(lower=1.0)
+    day_key = tser.dt.strftime("%Y-%m-%d")
+    vwap_num = (typical * vol).groupby(day_key).cumsum()
+    vwap_den = vol.groupby(day_key).cumsum().clip(lower=1.0)
+    vwap = vwap_num / vwap_den
 
     bars_m5 = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M5, 0, 260)
     if bars_m5 is None or len(bars_m5) < 100:
@@ -397,37 +426,135 @@ def compute_mode2_m1_scalp_signal(cfg):
     ema50_m5 = d5["close"].ewm(span=50, adjust=False).mean()
     trend_buy = float(ema20_m5.iloc[-1]) > float(ema50_m5.iloc[-1])
     trend_sell = float(ema20_m5.iloc[-1]) < float(ema50_m5.iloc[-1])
+    trend_flat = not trend_buy and not trend_sell
 
     i = len(df) - 1
     row = df.iloc[i]
     prev = df.iloc[i - 1]
+    prev2 = df.iloc[i - 2]
     a = float(atr_m1.iloc[i]) if float(atr_m1.iloc[i]) > 0 else 0.0
     if a <= 0:
         return None
     e9 = float(ema9.iloc[i])
+    e20 = float(ema20_m1.iloc[i])
+    e50 = float(ema50_m1.iloc[i])
     close = float(row["close"])
     open_ = float(row["open"])
     low = float(row["low"])
     high = float(row["high"])
+    prev_close = float(prev["close"])
+    prev_open = float(prev["open"])
+    prev_low = float(prev["low"])
+    prev_high = float(prev["high"])
+    prev2_open = float(prev2["open"])
+    prev2_close = float(prev2["close"])
+    vwap_now = float(vwap.iloc[i]) if np.isfinite(float(vwap.iloc[i])) else close
+    bb_up_now = float(bb_up.iloc[i]) if np.isfinite(float(bb_up.iloc[i])) else close + a
+    bb_dn_now = float(bb_dn.iloc[i]) if np.isfinite(float(bb_dn.iloc[i])) else close - a
 
     side = None
     reason = "no-setup"
-    if trend_buy and low <= e9 and close > e9 and close > open_:
-        side = "BUY"
-        reason = "m1 pullback buy confirm"
-    elif trend_sell and high >= e9 and close < e9 and close < open_:
-        side = "SELL"
-        reason = "m1 pullback sell confirm"
+    candidates = []
+
+    mode2_cfg = cfg.get("modes", {}).get(MODE_SCALP_M1_2, {})
+    strats = mode2_cfg.get("strategies", {}) if isinstance(mode2_cfg, dict) else {}
+
+    def strat_on(sid):
+        if not isinstance(strats, dict):
+            return True
+        return bool(strats.get(sid, True))
+
+    def add_candidate(sig_side, sid, why, priority):
+        candidates.append(
+            {
+                "side": sig_side,
+                "sid": sid,
+                "label": MODE2_STRATEGY_LABELS.get(sid, sid),
+                "reason": why,
+                "priority": int(priority),
+            }
+        )
+
+    # 1) Trend pullback: trend M5, entry M1 pullback EMA/VWAP.
+    if strat_on("trend_pullback"):
+        if trend_buy and low <= e9 and close > e9 and close > vwap_now and close > open_:
+            add_candidate("BUY", "trend_pullback", "M5 uptrend + M1 pullback EMA9/VWAP", 100)
+        elif trend_sell and high >= e9 and close < e9 and close < vwap_now and close < open_:
+            add_candidate("SELL", "trend_pullback", "M5 downtrend + M1 pullback EMA9/VWAP", 100)
+
+    # 2) Breakout: break short range (5-30m).
+    if strat_on("breakout") and i >= 40:
+        range_hi = float(df["high"].iloc[i - 30:i].max())
+        range_lo = float(df["low"].iloc[i - 30:i].min())
+        if close > range_hi + 0.05 * a and close > open_ and close > vwap_now:
+            add_candidate("BUY", "breakout", "breakout range 30m high", 88)
+        elif close < range_lo - 0.05 * a and close < open_ and close < vwap_now:
+            add_candidate("SELL", "breakout", "breakout range 30m low", 88)
+
+    # 3) Mean reversion: far from VWAP/Bollinger then snap back.
+    if strat_on("mean_reversion"):
+        if low < bb_dn_now and close > bb_dn_now and close > open_ and close < vwap_now:
+            add_candidate("BUY", "mean_reversion", "revert from lower Bollinger extreme", 72)
+        elif high > bb_up_now and close < bb_up_now and close < open_ and close > vwap_now:
+            add_candidate("SELL", "mean_reversion", "revert from upper Bollinger extreme", 72)
+
+    # 4) Reversal price-action around local support/resistance.
+    if strat_on("reversal_pa") and i >= 80:
+        support = float(df["low"].iloc[i - 80:i].min())
+        resistance = float(df["high"].iloc[i - 80:i].max())
+        near_support = abs(close - support) <= 0.30 * a
+        near_resistance = abs(close - resistance) <= 0.30 * a
+        bullish_engulf = (prev_close < prev_open) and (close > open_) and (open_ <= prev_close) and (close >= prev_open)
+        bearish_engulf = (prev_close > prev_open) and (close < open_) and (open_ >= prev_close) and (close <= prev_open)
+        bullish_pin = (close > open_) and ((open_ - low) > 1.5 * max(1e-9, (high - close)))
+        bearish_pin = (close < open_) and ((high - open_) > 1.5 * max(1e-9, (close - low)))
+        morning_star = (prev2_close < prev2_open) and (abs(prev_close - prev_open) < 0.35 * a) and (close > open_) and (close > (prev2_open + prev2_close) / 2.0)
+        evening_star = (prev2_close > prev2_open) and (abs(prev_close - prev_open) < 0.35 * a) and (close < open_) and (close < (prev2_open + prev2_close) / 2.0)
+        if near_support and (bullish_engulf or bullish_pin or morning_star):
+            add_candidate("BUY", "reversal_pa", "bullish reversal PA near support", 68)
+        elif near_resistance and (bearish_engulf or bearish_pin or evening_star):
+            add_candidate("SELL", "reversal_pa", "bearish reversal PA near resistance", 68)
+
+    # 5) Orderflow/imbalance proxy: liquidity sweep + CHOCH-style shift.
+    if strat_on("orderflow_proxy") and i >= 30:
+        swing_hi = float(df["high"].iloc[i - 20:i - 1].max())
+        swing_lo = float(df["low"].iloc[i - 20:i - 1].min())
+        bull_sweep = low < swing_lo and close > swing_lo + 0.15 * a
+        bear_sweep = high > swing_hi and close < swing_hi - 0.15 * a
+        choch_up = e20 > e50 and close > e20 and prev_close <= float(ema20_m1.iloc[i - 1])
+        choch_dn = e20 < e50 and close < e20 and prev_close >= float(ema20_m1.iloc[i - 1])
+        if bull_sweep and choch_up:
+            add_candidate("BUY", "orderflow_proxy", "liquidity sweep low + CHOCH up", 80)
+        elif bear_sweep and choch_dn:
+            add_candidate("SELL", "orderflow_proxy", "liquidity sweep high + CHOCH down", 80)
+
+    # 6) Session-based scalp: only London/NY overlap windows.
+    if strat_on("session_scalp"):
+        hour_utc = int(datetime.utcfromtimestamp(int(row["time"])).hour)
+        in_session = (7 <= hour_utc <= 11) or (13 <= hour_utc <= 17)
+        if in_session:
+            if trend_buy and low <= e9 and close > e9 and close > open_:
+                add_candidate("BUY", "session_scalp", "London/NY session pullback buy", 92)
+            elif trend_sell and high >= e9 and close < e9 and close < open_:
+                add_candidate("SELL", "session_scalp", "London/NY session pullback sell", 92)
 
     touch_band = 0.20 * a
-    buy_hint = max(e9, float(prev["close"]) + 0.01)
-    sell_hint = min(e9, float(prev["close"]) - 0.01)
+    buy_hint = max(e9, prev_close + 0.01)
+    sell_hint = min(e9, prev_close - 0.01)
     buy_hint = buy_hint if buy_hint <= e9 + touch_band else None
     sell_hint = sell_hint if sell_hint >= e9 - touch_band else None
 
     atr_hist = atr_m1.iloc[max(0, i - 288): i + 1].dropna().to_numpy(dtype=float)
     atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist)) if len(atr_hist) >= 8 else 0.5
     trend_strength = abs(float(ema20_m5.iloc[-1]) - float(ema50_m5.iloc[-1])) / max(1e-9, a)
+
+    if candidates:
+        candidates.sort(key=lambda x: x["priority"], reverse=True)
+        best = candidates[0]
+        side = best["side"]
+        reason = f"{best['label']} | {best['reason']} | candidates={len(candidates)}"
+    elif trend_flat:
+        reason = "no-setup: M5 trend neutral"
 
     return {
         "side": side,
