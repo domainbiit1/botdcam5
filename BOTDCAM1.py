@@ -22,6 +22,7 @@ import threading
 import io
 import subprocess
 import queue
+import traceback
 from collections import deque
 from itertools import combinations
 from pathlib import Path
@@ -2329,7 +2330,8 @@ def get_follow_m1_supertrend_m5_signal_info(cfg):
     mới bắt đầu (cây M5 trước đó vừa đóng).
 
     Return:
-      (side, active_m1_time, confirmed_m5_time, reason, closed_bar_flip)
+      (side, active_m1_time, confirmed_m5_time, reason, closed_bar_flip,
+       flip_buffer_ok, flip_buffer_reason)
     """
     try:
         sym = cfg["symbol"]
@@ -2339,7 +2341,7 @@ def get_follow_m1_supertrend_m5_signal_info(cfg):
 
         raw = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M5, 0, need + 5)
         if raw is None or len(raw) < period + 16:
-            return None, None, None, "not_enough_m5_bars", False
+            return None, None, None, "not_enough_m5_bars", False, False, "no_m5_data"
 
         # MT5 trả dữ liệu theo thời gian tăng dần, phần tử cuối là bar M5 đang
         # chạy (shift=0). Loại nó theo timestamp, không dựa vào giá live.
@@ -2347,7 +2349,7 @@ def get_follow_m1_supertrend_m5_signal_info(cfg):
         active_m5_time = int(raw_df.iloc[-1]["time"])
         df = raw_df[raw_df["time"].astype("int64") < active_m5_time].reset_index(drop=True)
         if len(df) < period + 12:
-            return None, None, None, "not_enough_closed_m5_bars", False
+            return None, None, None, "not_enough_closed_m5_bars", False, False, "not_enough_closed_m5"
 
         high = df["high"].astype(float)
         low = df["low"].astype(float)
@@ -2386,20 +2388,89 @@ def get_follow_m1_supertrend_m5_signal_info(cfg):
         # Cổng vào lệnh vẫn theo cây M1 đang chạy: tối đa một lệnh / phút.
         m1 = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_M1, 0, 2)
         if m1 is None or len(m1) < 1:
-            return None, None, None, "not_enough_m1_clock", False
+            return None, None, None, "not_enough_m1_clock", False, False, "no_m1_clock"
         active_m1_time = int(m1[-1]["time"])
         confirmed_m5_time = int(df.iloc[-1]["time"])
         signal = "BUY" if trend[-1] == 1 else "SELL"
         previous = "BUY" if trend[-2] == 1 else "SELL"
         closed_bar_flip = n >= 2 and trend[-1] != trend[-2]
+        # Flip buffer: chi phuc vu gate doi chieu, khong lam cham entry cung chieu.
+        # BUY dung final_lower; SELL dung final_upper.
+        last_close = float(close_v[-1])
+        last_atr = float(atr.iloc[-1]) if float(atr.iloc[-1]) > 0 else 0.0
+        st_line = float(final_lower[-1] if signal == "BUY" else final_upper[-1])
+        dist = abs(last_close - st_line)
+        flip_k = max(0.0, float(cfg.get("follow_m1_flip_buffer_atr", 0.20)))
+        need = max(0.0, flip_k * last_atr)
+        flip_buffer_ok = bool(last_atr > 0 and dist >= need)
+        flip_buffer_reason = f"st_dist={dist:.2f} need={need:.2f} atr={last_atr:.2f}"
         suffix = f" | CLOSED-FLIP {previous}->{signal}" if closed_bar_flip else ""
         return signal, active_m1_time, confirmed_m5_time, (
             f"M5 Supertrend({period},{multiplier:.2f})={signal}; "
             f"confirmed M5={confirmed_m5_time}; active M5={active_m5_time}; order clock=M1{suffix}"
-        ), closed_bar_flip
+        ), closed_bar_flip, flip_buffer_ok, flip_buffer_reason
     except Exception as e:
         log(f"get_follow_m1_supertrend_m5_signal_info exception: {e}", "warn")
-        return None, None, None, "exception", False
+        return None, None, None, "exception", False, False, "exception"
+
+
+def get_m15_di_confirmation_for_side(cfg, side):
+    """Xac nhan huong BUY/SELL tren M15 bang ADX/DI closed bars only."""
+    try:
+        period = 14
+        bars = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M15, 0, 120)
+        if bars is None or len(bars) < period + 20:
+            return False, "m15_not_enough_bars"
+
+        df = pd.DataFrame(bars).iloc[:-1].reset_index(drop=True)
+        if len(df) < period + 20:
+            return False, "m15_not_enough_closed_bars"
+
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        close = df["close"].astype(float)
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = pd.Series(0.0, index=df.index)
+        minus_dm = pd.Series(0.0, index=df.index)
+        plus_dm[(up_move > down_move) & (up_move > 0)] = up_move
+        minus_dm[(down_move > up_move) & (down_move > 0)] = down_move
+
+        plus_di = 100 * plus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, 1)
+        minus_di = 100 * minus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, 1)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1)
+        adx = dx.ewm(alpha=1.0 / period, adjust=False).mean()
+
+        pdi = float(plus_di.iloc[-1])
+        mdi = float(minus_di.iloc[-1])
+        adx_val = float(adx.iloc[-1])
+        gap = abs(pdi - mdi)
+
+        try:
+            gap_min = float(cfg.get("follow_m1_flip_m15_di_gap_min", 5.0))
+        except Exception:
+            gap_min = 5.0
+        try:
+            adx_min = float(cfg.get("follow_m1_flip_m15_adx_min", 18.0))
+        except Exception:
+            adx_min = 18.0
+
+        if adx_val < adx_min or gap < gap_min:
+            return False, f"m15_weak adx={adx_val:.1f} gap={gap:.1f}"
+        if side == "BUY" and pdi > mdi:
+            return True, f"m15_buy pdi={pdi:.1f}>{mdi:.1f} adx={adx_val:.1f}"
+        if side == "SELL" and mdi > pdi:
+            return True, f"m15_sell mdi={mdi:.1f}>{pdi:.1f} adx={adx_val:.1f}"
+        return False, f"m15_opposite pdi={pdi:.1f} mdi={mdi:.1f}"
+    except Exception as e:
+        return False, f"m15_exception {e}"
 
 def get_m1_trend_filter_direction(cfg):
     """
@@ -4152,6 +4223,12 @@ def run(cfg):
     cfg.setdefault("follow_m1_unlimited_max_lot", True)
     cfg.setdefault("follow_m1_supertrend_m5_period", 10)
     cfg.setdefault("follow_m1_supertrend_m5_multiplier", 3.0)
+    # Follow M1 flip filter (preset CAN BANG):
+    # Chi gate khi doi chieu BUY<->SELL, khong lam cham entry cung chieu.
+    cfg.setdefault("follow_m1_flip_filter_enabled", True)
+    cfg.setdefault("follow_m1_flip_buffer_atr", 0.20)
+    cfg.setdefault("follow_m1_flip_m15_di_gap_min", 5.0)
+    cfg.setdefault("follow_m1_flip_m15_adx_min", 18.0)
     cfg.setdefault("follow_m1_live_lock_buffer_pair_pct", 0.10)   # 10% |Pair Min|
     cfg.setdefault("follow_m1_live_lock_buffer_slippage_ticks", 2.0)
     cfg.setdefault("m1_trend_adx_min", 22.0)
@@ -4641,7 +4718,7 @@ def run(cfg):
                             imm_rec = m1_recovery_force_decision(positions, sym, cfg)
                             imm_stop_pct = max(float(cfg.get("m1_recovery_stop_add_pct", 50.0)), 50.0)
                             if strategy_mode == "Follow M1":
-                                _, imm_bar_time, _, _, _ = get_follow_m1_supertrend_m5_signal_info(cfg)
+                                _, imm_bar_time, _, _, _, _, _ = get_follow_m1_supertrend_m5_signal_info(cfg)
                             else:
                                 _, imm_bar_time = get_m1_closed_signal_info(cfg)
                         elif strategy_mode == "Farm":
@@ -4756,7 +4833,7 @@ def run(cfg):
                             time.sleep(0.1); continue
 
             elif strategy_mode == "Follow M1":
-                raw_side, current_follow_m1_bar_time, confirmed_m5_time, _follow_m1_live_reason, closed_m5_flip = get_follow_m1_supertrend_m5_signal_info(cfg)
+                raw_side, current_follow_m1_bar_time, confirmed_m5_time, _follow_m1_live_reason, closed_m5_flip, st_flip_ok, st_flip_reason = get_follow_m1_supertrend_m5_signal_info(cfg)
                 if raw_side is None or confirmed_m5_time is None:
                     if now - last_log_t > 15:
                         log(f"Follow M1: chua co Supertrend M5 da dong ({_follow_m1_live_reason}), cho...", "warn")
@@ -4775,13 +4852,33 @@ def run(cfg):
                 elif confirmed_m5_time > follow_m1_confirmed_m5_time:
                     previous_side = follow_m1_confirmed_m5_side
                     follow_m1_confirmed_m5_time = confirmed_m5_time
-                    follow_m1_confirmed_m5_side = raw_side
-                    h1 = raw_side
-                    _follow_m1_live_fast = (previous_side in ("BUY", "SELL") and previous_side != h1)
-                    if _follow_m1_live_fast:
-                        log(f"[FOLLOW M1 M5-ST CLOSED FLIP] {previous_side}->{h1}; M5 #{confirmed_m5_time} da DONG xac nhan -> toi da 1 lenh/M1", "warn")
+                    if (bool(cfg.get("follow_m1_flip_filter_enabled", True))
+                            and previous_side in ("BUY", "SELL")
+                            and raw_side in ("BUY", "SELL")
+                            and raw_side != previous_side):
+                        m15_ok, m15_reason = get_m15_di_confirmation_for_side(cfg, raw_side)
+                        if st_flip_ok or m15_ok:
+                            follow_m1_confirmed_m5_side = raw_side
+                            h1 = raw_side
+                            _follow_m1_live_fast = True
+                            gate_source = "ST-BUFFER" if st_flip_ok else "M15-DI"
+                            log(f"[FOLLOW M1 M5-ST FLIP-OK] {previous_side}->{h1}; "
+                                f"M5 #{confirmed_m5_time} da DONG | gate={gate_source} | {st_flip_reason} | {m15_reason}", "warn")
+                        else:
+                            # Flip yeu -> giu huong cu, khong doi side de tranh whip-saw.
+                            follow_m1_confirmed_m5_side = previous_side
+                            h1 = previous_side
+                            _follow_m1_live_fast = False
+                            log(f"[FOLLOW M1 M5-ST FLIP-SKIP] {previous_side}->{raw_side}; "
+                                f"M5 #{confirmed_m5_time} da DONG nhung gate fail | {st_flip_reason} | {m15_reason} -> giu {h1}", "warn")
                     else:
-                        log(f"[FOLLOW M1 M5-ST NEW CLOSED BAR] M5 #{confirmed_m5_time} da dong, giu {h1}", "info")
+                        follow_m1_confirmed_m5_side = raw_side
+                        h1 = raw_side
+                        _follow_m1_live_fast = (previous_side in ("BUY", "SELL") and previous_side != h1)
+                        if _follow_m1_live_fast:
+                            log(f"[FOLLOW M1 M5-ST CLOSED FLIP] {previous_side}->{h1}; M5 #{confirmed_m5_time} da DONG xac nhan -> toi da 1 lenh/M1", "warn")
+                        else:
+                            log(f"[FOLLOW M1 M5-ST NEW CLOSED BAR] M5 #{confirmed_m5_time} da dong, giu {h1}", "info")
                 elif confirmed_m5_time == follow_m1_confirmed_m5_time:
                     h1 = follow_m1_confirmed_m5_side
                     _follow_m1_live_fast = False
