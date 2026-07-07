@@ -229,6 +229,31 @@ def account_positions_all_modes(cfg):
     return [p for p in pos if int(getattr(p, "magic", 0)) in mode_magics]
 
 
+def strategy_id_from_comment(comment, mode_id):
+    c = str(comment or "")
+    if not c.startswith("EAGoldSuper:"):
+        return None
+    parts = c.split(":")
+    if len(parts) >= 3 and parts[1] == mode_id:
+        return parts[2]
+    # Backward compatibility with old Mode 2 comment format.
+    if len(parts) == 2 and parts[1] == MODE_SCALP_M1_2 and mode_id == MODE_SCALP_M1_2:
+        return "trend_pullback"
+    return None
+
+
+def count_strategy_positions(cfg, mode_id, strategy_id):
+    if not strategy_id:
+        return 0
+    pos = my_positions(cfg, mode_id)
+    out = 0
+    for p in pos:
+        sid = strategy_id_from_comment(getattr(p, "comment", ""), mode_id)
+        if sid == strategy_id:
+            out += 1
+    return out
+
+
 def normalize_mode_settings(cfg):
     modes = cfg.get("modes", {})
     if not isinstance(modes, dict):
@@ -548,11 +573,11 @@ def compute_mode2_m1_scalp_signal(cfg):
     atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist)) if len(atr_hist) >= 8 else 0.5
     trend_strength = abs(float(ema20_m5.iloc[-1]) - float(ema50_m5.iloc[-1])) / max(1e-9, a)
 
-    if candidates:
-        candidates.sort(key=lambda x: x["priority"], reverse=True)
-        best = candidates[0]
+    ranked = sorted(candidates, key=lambda x: x["priority"], reverse=True)
+    if ranked:
+        best = ranked[0]
         side = best["side"]
-        reason = f"{best['label']} | {best['reason']} | candidates={len(candidates)}"
+        reason = f"{best['label']} | {best['reason']} | candidates={len(ranked)}"
     elif trend_flat:
         reason = "no-setup: M5 trend neutral"
 
@@ -566,6 +591,7 @@ def compute_mode2_m1_scalp_signal(cfg):
         "sell_price_hint": sell_hint,
         "atr_rank": atr_rank,
         "trend_strength": trend_strength,
+        "candidates": ranked,
     }
 
 
@@ -707,6 +733,8 @@ def open_trade(cfg, side, signal):
         otype = mt5.ORDER_TYPE_SELL
 
     mode_id = str(signal.get("mode", MODE_LVN_1))
+    strategy_id = str(signal.get("strategy_id", "") or "")
+    trade_comment = f"EAGoldSuper:{mode_id}:{strategy_id}" if strategy_id else f"EAGoldSuper:{mode_id}"
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": cfg["symbol"],
@@ -717,7 +745,7 @@ def open_trade(cfg, side, signal):
         "tp": tp,
         "deviation": int(cfg.get("deviation", 25)),
         "magic": int(mode_magic(cfg, mode_id)),
-        "comment": f"EAGoldSuper:{mode_id}",
+        "comment": trade_comment,
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
@@ -768,6 +796,7 @@ def push_status(
     floating = float(sum(float(p.profit) for p in positions)) if positions else 0.0
     mode_runtime = mode_runtime or {}
     mode_stats = []
+    signal_rows = []
     for mode in MODE_LABELS:
         mpos = my_positions(cfg, mode)
         mfloating = float(sum(float(p.profit) for p in mpos)) if mpos else 0.0
@@ -790,6 +819,36 @@ def push_status(
                 "profile_text": str(rt.get("profile_text", "-")),
             }
         )
+        if mode == MODE_SCALP_M1_2:
+            mode_cfg = cfg.get("modes", {}).get(mode, {})
+            strat_cfg = mode_cfg.get("strategies", {}) if isinstance(mode_cfg, dict) else {}
+            enabled_strats = [sid for sid in MODE2_STRATEGY_LABELS if bool(strat_cfg.get(sid, True))]
+            if not enabled_strats:
+                enabled_strats = list(MODE2_STRATEGY_LABELS.keys())
+            rt_strats = rt.get("strategies", {}) if isinstance(rt, dict) else {}
+            for sid in enabled_strats:
+                srt = rt_strats.get(sid, {})
+                signal_rows.append(
+                    {
+                        "mode_label": MODE_LABELS.get(mode, mode),
+                        "strategy_label": MODE2_STRATEGY_LABELS.get(sid, sid),
+                        "state": str(srt.get("last_signal", "WAIT")),
+                        "reason": str(srt.get("signal_reason", "no-setup")),
+                        "buy_hint": srt.get("buy_hint"),
+                        "sell_hint": srt.get("sell_hint"),
+                    }
+                )
+        else:
+            signal_rows.append(
+                {
+                    "mode_label": MODE_LABELS.get(mode, mode),
+                    "strategy_label": "-",
+                    "state": str(rt.get("last_signal", "-")),
+                    "reason": str(rt.get("signal_reason", "-")),
+                    "buy_hint": rt.get("buy_hint"),
+                    "sell_hint": rt.get("sell_hint"),
+                }
+            )
     send(
         {
             "type": "status",
@@ -807,6 +866,7 @@ def push_status(
             "entry_hint": entry_hint,
             "active_mode": active_mode_label,
             "mode_stats": mode_stats,
+            "signal_rows": signal_rows,
             "positions": [
                 {
                     "ticket": int(p.ticket),
@@ -865,7 +925,18 @@ def run_worker(cfg):
             "entry_hint": "-",
             "buy_hint": None,
             "sell_hint": None,
+            "strategies": {},
         }
+        if mode == MODE_SCALP_M1_2:
+            for sid in MODE2_STRATEGY_LABELS:
+                mode_runtime[mode]["strategies"][sid] = {
+                    "last_time": 0,
+                    "last_signal": "WAIT",
+                    "signal_reason": "warming up",
+                    "entry_hint": "-",
+                    "buy_hint": None,
+                    "sell_hint": None,
+                }
     last_signal = "-"
     signal_reason = "-"
     profile_text = "Auto SL/TP: warming up"
@@ -878,50 +949,136 @@ def run_worker(cfg):
             enabled_modes = get_active_modes(cfg)
             active_mode_label = ", ".join(MODE_LABELS.get(m, m) for m in enabled_modes)
             for mode in enabled_modes:
-                sig = None
                 if mode == MODE_LVN_1:
                     sig = compute_mode1_lvn_signal(cfg)
+                    if not sig:
+                        continue
+                    sig["mode"] = mode
+                    mode_label = MODE_LABELS.get(mode, mode)
+                    sig_side = sig.get("side")
+                    sig_time = int(sig.get("m5_time") or 0)
+                    s_reason = str(sig.get("reason", ""))
+                    buy_hint = sig.get("buy_price_hint")
+                    sell_hint = sig.get("sell_price_hint")
+                    buy_txt = f"Giá {buy_hint:.2f} - Buy" if isinstance(buy_hint, (int, float)) else "Buy: chưa hợp lệ"
+                    sell_txt = f"Giá {sell_hint:.2f} - Sell" if isinstance(sell_hint, (int, float)) else "Sell: chưa hợp lệ"
+                    hint_text = f"{sell_txt} | {buy_txt}"
+                    mode_runtime[mode]["last_signal"] = sig_side if sig_side in ("BUY", "SELL") else "WAIT"
+                    mode_runtime[mode]["signal_reason"] = s_reason
+                    mode_runtime[mode]["entry_hint"] = hint_text
+                    mode_runtime[mode]["buy_hint"] = buy_hint if isinstance(buy_hint, (int, float)) else None
+                    mode_runtime[mode]["sell_hint"] = sell_hint if isinstance(sell_hint, (int, float)) else None
+                    prof = auto_sl_tp_profile(sig)
+                    mode_runtime[mode]["profile_text"] = (
+                        f"{mode_label} | {prof['regime']} | SL={prof['sl_mult']:.2f}ATR | RR={prof['rr']:.2f} | "
+                        f"atrRank={prof['atr_rank']:.0%} trend={prof['trend_strength']:.2f}"
+                    )
+
+                    if sig_side in ("BUY", "SELL"):
+                        last_signal = f"{mode_label}: {sig_side}"
+                        signal_reason = s_reason
+                        profile_text = mode_runtime[mode]["profile_text"]
+                        entry_hint = hint_text
+
+                    if sig_time > 0 and sig_time != int(mode_runtime[mode]["last_time"]):
+                        mode_runtime[mode]["last_time"] = sig_time
+                        positions = my_positions(cfg, mode)
+                        if len(positions) < int(cfg.get("max_positions", 1)) and sig_side in ("BUY", "SELL"):
+                            ok, reason = open_trade(cfg, sig_side, sig)
+                            if not ok:
+                                log(f"[{mode_label}] Skip open {sig_side}: {reason}", "warn")
+                        else:
+                            if sig_side in ("BUY", "SELL"):
+                                log(f"[{mode_label}] Signal {sig_side} but max_positions reached ({len(positions)})", "info")
                 elif mode == MODE_SCALP_M1_2:
                     sig = compute_mode2_m1_scalp_signal(cfg)
-                if not sig:
-                    continue
-                sig["mode"] = mode
-                mode_label = MODE_LABELS.get(mode, mode)
-                sig_side = sig.get("side")
-                sig_time = int(sig.get("m5_time") or 0)
-                s_reason = str(sig.get("reason", ""))
-                buy_hint = sig.get("buy_price_hint")
-                sell_hint = sig.get("sell_price_hint")
-                buy_txt = f"Giá {buy_hint:.2f} - Buy" if isinstance(buy_hint, (int, float)) else "Buy: chưa hợp lệ"
-                sell_txt = f"Giá {sell_hint:.2f} - Sell" if isinstance(sell_hint, (int, float)) else "Sell: chưa hợp lệ"
-                hint_text = f"{sell_txt} | {buy_txt}"
-                mode_runtime[mode]["last_signal"] = sig_side if sig_side in ("BUY", "SELL") else "WAIT"
-                mode_runtime[mode]["signal_reason"] = s_reason
-                mode_runtime[mode]["entry_hint"] = hint_text
-                mode_runtime[mode]["buy_hint"] = buy_hint if isinstance(buy_hint, (int, float)) else None
-                mode_runtime[mode]["sell_hint"] = sell_hint if isinstance(sell_hint, (int, float)) else None
-                prof = auto_sl_tp_profile(sig)
-                mode_runtime[mode]["profile_text"] = (
-                    f"{mode_label} | {prof['regime']} | SL={prof['sl_mult']:.2f}ATR | RR={prof['rr']:.2f} | "
-                    f"atrRank={prof['atr_rank']:.0%} trend={prof['trend_strength']:.2f}"
-                )
+                    if not sig:
+                        continue
+                    sig["mode"] = mode
+                    mode_label = MODE_LABELS.get(mode, mode)
+                    sig_time = int(sig.get("m5_time") or 0)
+                    buy_hint = sig.get("buy_price_hint")
+                    sell_hint = sig.get("sell_price_hint")
+                    buy_txt = f"Giá {buy_hint:.2f} - Buy" if isinstance(buy_hint, (int, float)) else "Buy: chưa hợp lệ"
+                    sell_txt = f"Giá {sell_hint:.2f} - Sell" if isinstance(sell_hint, (int, float)) else "Sell: chưa hợp lệ"
+                    hint_text = f"{sell_txt} | {buy_txt}"
+                    prof = auto_sl_tp_profile(sig)
+                    mode_runtime[mode]["profile_text"] = (
+                        f"{mode_label} | {prof['regime']} | SL={prof['sl_mult']:.2f}ATR | RR={prof['rr']:.2f} | "
+                        f"atrRank={prof['atr_rank']:.0%} trend={prof['trend_strength']:.2f}"
+                    )
 
-                if sig_side in ("BUY", "SELL"):
-                    last_signal = f"{mode_label}: {sig_side}"
-                    signal_reason = s_reason
-                    profile_text = mode_runtime[mode]["profile_text"]
-                    entry_hint = hint_text
+                    mode2_cfg = cfg.get("modes", {}).get(mode, {})
+                    strat_cfg = mode2_cfg.get("strategies", {}) if isinstance(mode2_cfg, dict) else {}
+                    enabled_strats = [sid for sid in MODE2_STRATEGY_LABELS if bool(strat_cfg.get(sid, True))]
+                    if not enabled_strats:
+                        enabled_strats = list(MODE2_STRATEGY_LABELS.keys())
 
-                if sig_time > 0 and sig_time != int(mode_runtime[mode]["last_time"]):
-                    mode_runtime[mode]["last_time"] = sig_time
-                    positions = my_positions(cfg, mode)
-                    if len(positions) < int(cfg.get("max_positions", 1)) and sig_side in ("BUY", "SELL"):
-                        ok, reason = open_trade(cfg, sig_side, sig)
-                        if not ok:
-                            log(f"[{mode_label}] Skip open {sig_side}: {reason}", "warn")
+                    candidate_map = {}
+                    for c in sig.get("candidates", []) or []:
+                        sid = str(c.get("sid", ""))
+                        if sid:
+                            candidate_map[sid] = c
+
+                    active_signals = []
+                    for sid in enabled_strats:
+                        srt = mode_runtime[mode]["strategies"].setdefault(
+                            sid,
+                            {
+                                "last_time": 0,
+                                "last_signal": "WAIT",
+                                "signal_reason": "warming up",
+                                "entry_hint": "-",
+                                "buy_hint": None,
+                                "sell_hint": None,
+                            },
+                        )
+                        cand = candidate_map.get(sid)
+                        s_side = str(cand.get("side")) if cand else "WAIT"
+                        s_reason = str(cand.get("reason", "no-setup")) if cand else "no-setup"
+                        srt["last_signal"] = s_side if s_side in ("BUY", "SELL") else "WAIT"
+                        srt["signal_reason"] = s_reason
+                        srt["entry_hint"] = hint_text
+                        srt["buy_hint"] = buy_hint if isinstance(buy_hint, (int, float)) else None
+                        srt["sell_hint"] = sell_hint if isinstance(sell_hint, (int, float)) else None
+
+                        if s_side in ("BUY", "SELL"):
+                            active_signals.append(f"{MODE2_STRATEGY_LABELS.get(sid, sid)}:{s_side}")
+                            if sig_time > 0 and sig_time != int(srt.get("last_time", 0)):
+                                srt["last_time"] = sig_time
+                                current_open = count_strategy_positions(cfg, mode, sid)
+                                if current_open < 1:
+                                    s_sig = dict(sig)
+                                    s_sig["strategy_id"] = sid
+                                    s_sig["side"] = s_side
+                                    s_sig["reason"] = f"{MODE2_STRATEGY_LABELS.get(sid, sid)} | {s_reason}"
+                                    ok, reason = open_trade(cfg, s_side, s_sig)
+                                    if not ok:
+                                        log(
+                                            f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] Skip open {s_side}: {reason}",
+                                            "warn",
+                                        )
+                                else:
+                                    log(
+                                        f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] Signal {s_side} but strategy max 1 reached",
+                                        "info",
+                                    )
+
+                    mode_runtime[mode]["buy_hint"] = buy_hint if isinstance(buy_hint, (int, float)) else None
+                    mode_runtime[mode]["sell_hint"] = sell_hint if isinstance(sell_hint, (int, float)) else None
+                    mode_runtime[mode]["entry_hint"] = hint_text
+                    if active_signals:
+                        mode_runtime[mode]["last_signal"] = " | ".join(active_signals)
+                        mode_runtime[mode]["signal_reason"] = "; ".join(
+                            str((candidate_map.get(sid) or {}).get("reason", "-")) for sid in enabled_strats if sid in candidate_map
+                        )
+                        last_signal = f"{mode_label}: {mode_runtime[mode]['last_signal']}"
+                        signal_reason = mode_runtime[mode]["signal_reason"]
+                        profile_text = mode_runtime[mode]["profile_text"]
+                        entry_hint = hint_text
                     else:
-                        if sig_side in ("BUY", "SELL"):
-                            log(f"[{mode_label}] Signal {sig_side} but max_positions reached ({len(positions)})", "info")
+                        mode_runtime[mode]["last_signal"] = "WAIT"
+                        mode_runtime[mode]["signal_reason"] = str(sig.get("reason", "no-setup"))
 
             # Always expose signal state per enabled mode (even WAIT), so GUI
             # never looks blank while waiting for setups.
@@ -1276,8 +1433,8 @@ class LVNWindow(QtWidgets.QMainWindow):
         sig_cap.setObjectName("caption")
         self.lb_signal = QtWidgets.QLabel("Đang chờ dữ liệu...")
         self.lb_signal.setObjectName("metricWeak")
-        self.signal_tbl = QtWidgets.QTableWidget(0, 5)
-        self.signal_tbl.setHorizontalHeaderLabels(["Mode", "State", "Sell", "Buy", "Reason"])
+        self.signal_tbl = QtWidgets.QTableWidget(0, 6)
+        self.signal_tbl.setHorizontalHeaderLabels(["Mode", "Strategy", "State", "Sell", "Buy", "Reason"])
         self.signal_tbl.verticalHeader().setVisible(False)
         self.signal_tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.signal_tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
@@ -1288,10 +1445,12 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.signal_tbl.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
         self.signal_tbl.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
         self.signal_tbl.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
-        self.signal_tbl.setColumnWidth(0, 205)
-        self.signal_tbl.setColumnWidth(1, 85)
-        self.signal_tbl.setColumnWidth(2, 110)
-        self.signal_tbl.setColumnWidth(3, 110)
+        self.signal_tbl.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.signal_tbl.setColumnWidth(0, 190)
+        self.signal_tbl.setColumnWidth(1, 185)
+        self.signal_tbl.setColumnWidth(2, 85)
+        self.signal_tbl.setColumnWidth(3, 100)
+        self.signal_tbl.setColumnWidth(4, 100)
         signal_l.addWidget(sig_cap)
         signal_l.addWidget(self.lb_signal)
         signal_l.addWidget(self.signal_tbl)
@@ -1406,10 +1565,23 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.lb_auto_profile.setText(f"Auto profile: {obj.get('profile_text', '-')}")
         self.lb_strategy.setText(f"ACTIVE: {obj.get('active_mode', 'Mode 1 - LVN Adaptive')} | Max position = 1")
         self.lb_runtime_state.setText("ONLINE")
-        mode_stats = obj.get("mode_stats", []) or []
-        self.signal_tbl.setRowCount(len(mode_stats))
-        for r, m in enumerate(mode_stats):
-            state = str(m.get("last_signal", "-"))
+        signal_rows = obj.get("signal_rows", []) or []
+        if not signal_rows:
+            for m in obj.get("mode_stats", []) or []:
+                signal_rows.append(
+                    {
+                        "mode_label": str(m.get("label", m.get("id", "-"))),
+                        "strategy_label": "-",
+                        "state": str(m.get("last_signal", "-")),
+                        "reason": str(m.get("signal_reason", "-")),
+                        "buy_hint": m.get("buy_hint"),
+                        "sell_hint": m.get("sell_hint"),
+                    }
+                )
+
+        self.signal_tbl.setRowCount(len(signal_rows))
+        for r, m in enumerate(signal_rows):
+            state = str(m.get("state", "-"))
             if state == "BUY":
                 state_color = "#22c55e"
             elif state == "SELL":
@@ -1420,18 +1592,18 @@ class LVNWindow(QtWidgets.QMainWindow):
             sell_hint = m.get("sell_hint")
             buy_txt = f"{float(buy_hint):.2f}" if isinstance(buy_hint, (int, float)) else "-"
             sell_txt = f"{float(sell_hint):.2f}" if isinstance(sell_hint, (int, float)) else "-"
-            reason = str(m.get("signal_reason", "-"))
-            vals = [str(m.get("label", m.get("id", "-"))), state, sell_txt, buy_txt, reason]
+            reason = str(m.get("reason", "-"))
+            vals = [str(m.get("mode_label", "-")), str(m.get("strategy_label", "-")), state, sell_txt, buy_txt, reason]
             for c, v in enumerate(vals):
                 it = QtWidgets.QTableWidgetItem(v)
-                if c in (2, 3):
+                if c in (3, 4):
                     it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                elif c == 1:
+                elif c == 2:
                     it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 # Keep table readable in all themes/states.
                 bg = "#0a1324" if (r % 2 == 0) else "#0c1730"
                 it.setBackground(QtGui.QColor(bg))
-                if c == 1:
+                if c == 2:
                     it.setForeground(QtGui.QColor(state_color))
                 else:
                     it.setForeground(QtGui.QColor("#dbe8ff"))
