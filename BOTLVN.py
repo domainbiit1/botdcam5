@@ -628,29 +628,49 @@ def save_cfg(cfg):
 
 
 QSS = """
-QWidget { background:#070c18; color:#e6edf7; font-family:'Segoe UI'; font-size:12px; }
-QFrame#hero {
-    background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #111d38, stop:1 #10263d);
-    border:1px solid #2a3f66; border-radius:14px;
+QWidget { background:#060b16; color:#e7eefc; font-family:'Segoe UI'; font-size:12px; }
+QFrame#topbar {
+    background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0e1d39, stop:1 #11243b);
+    border:1px solid #2a4169; border-radius:14px;
 }
-QFrame#panel { background:#0f182d; border:1px solid #263b5f; border-radius:12px; }
-QLabel#title { font-size:20px; font-weight:800; color:#f8fbff; }
-QLabel#sub { color:#8fb3dd; font-size:11px; }
-QLabel#caption { color:#7f93b1; font-size:10px; font-weight:700; letter-spacing:0.6px; }
-QLabel#metric { color:#f2f7ff; font-size:15px; font-weight:700; font-family:'Consolas'; }
+QFrame#sidebar, QFrame#mainpanel {
+    background:#0c1528; border:1px solid #24395d; border-radius:12px;
+}
+QFrame#sectionCard {
+    background:#0a1222; border:1px solid #1f3356; border-radius:10px;
+}
+QFrame#metricCard {
+    background:#0a1222; border:1px solid #1f3356; border-radius:10px;
+}
+QFrame#signalCard {
+    background:#0d1a31; border:1px solid #25406a; border-radius:10px;
+}
+QLabel#title { font-size:21px; font-weight:800; color:#f8fbff; }
+QLabel#sub { color:#90afd8; font-size:11px; }
+QLabel#sectionTitle { color:#67b2ff; font-size:11px; font-weight:800; letter-spacing:0.7px; }
+QLabel#caption { color:#7e93b5; font-size:10px; font-weight:700; }
+QLabel#metric { color:#f6faff; font-size:17px; font-weight:800; font-family:'Consolas'; }
+QLabel#metricWeak { color:#b8cae8; font-size:13px; font-weight:700; font-family:'Consolas'; }
 QLineEdit, QDoubleSpinBox {
-    background:#0a1222; border:1px solid #304768; border-radius:8px; padding:6px 10px; color:#f6fbff;
+    background:#0a1222; border:1px solid #314b74; border-radius:8px; padding:7px 10px; color:#f6fbff;
 }
-QLineEdit:focus, QDoubleSpinBox:focus { border:1px solid #67b2ff; }
+QLineEdit:focus, QDoubleSpinBox:focus { border:1px solid #6ab6ff; }
 QPushButton {
-    border-radius:8px; padding:7px 14px; font-weight:700; border:1px solid #334e77; background:#16243c; color:#dce8fb;
+    border-radius:8px; padding:8px 14px; font-weight:700; border:1px solid #36537d; background:#152640; color:#dce9ff;
 }
-QPushButton#start { background:#18a567; border:none; color:#031f13; }
-QPushButton#stop { background:#d43b52; border:none; color:#fff; }
-QPushButton#save { background:#2f7ff0; border:none; color:#fff; }
-QPlainTextEdit { background:#081121; border:1px solid #223a5e; border-radius:10px; padding:6px; }
-QTableWidget { background:#081121; border:1px solid #223a5e; border-radius:10px; gridline-color:#1a2f4f; }
-QHeaderView::section { background:#142744; color:#d7e7ff; border:none; padding:7px; font-weight:700; }
+QPushButton#start { background:#18a767; border:none; color:#031e13; }
+QPushButton#stop { background:#d23f54; border:none; color:#fff; }
+QPushButton#save { background:#2f7ef0; border:none; color:#fff; }
+QPushButton:hover { border-color:#6ab6ff; }
+QTabWidget::pane { border:1px solid #24395d; border-radius:10px; background:#0a1222; }
+QTabBar::tab {
+    background:#101b31; border:1px solid #24395d; border-bottom:none; border-top-left-radius:8px; border-top-right-radius:8px;
+    padding:7px 12px; margin-right:4px; color:#adc4e9; font-weight:700;
+}
+QTabBar::tab:selected { background:#163058; color:#f1f7ff; }
+QPlainTextEdit { background:#060f1e; border:1px solid #223a5e; border-radius:8px; padding:6px; }
+QTableWidget { background:#060f1e; border:1px solid #223a5e; border-radius:8px; gridline-color:#192f4f; }
+QHeaderView::section { background:#132644; color:#d6e6ff; border:none; padding:7px; font-weight:700; }
 """
 
 
@@ -688,21 +708,26 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(root)
         layout = QtWidgets.QVBoxLayout(root)
         layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         header = QtWidgets.QFrame()
-        header.setObjectName("hero")
+        header.setObjectName("topbar")
         h = QtWidgets.QHBoxLayout(header)
-        h.setContentsMargins(16, 14, 16, 14)
-        title = QtWidgets.QLabel("LVN BOT - Auto SL/TP theo M5")
+        h.setContentsMargins(16, 12, 16, 12)
+        h.setSpacing(10)
+        title = QtWidgets.QLabel("LVN BOT PRO")
         title.setObjectName("title")
-        subtitle = QtWidgets.QLabel("Giữ đơn giản: chỉ chỉnh Risk %/lệnh. Bot tự tính SL/TP theo biến động thị trường M5.")
+        subtitle = QtWidgets.QLabel("TP/SL tự động theo M5 regime · User chỉ chỉnh Risk %/lệnh")
         subtitle.setObjectName("sub")
         left = QtWidgets.QVBoxLayout()
+        left.setSpacing(2)
         left.addWidget(title)
         left.addWidget(subtitle)
         h.addLayout(left)
         h.addStretch(1)
+        self.lb_runtime_state = QtWidgets.QLabel("OFFLINE")
+        self.lb_runtime_state.setObjectName("metricWeak")
+        h.addWidget(self.lb_runtime_state)
         self.b_save = QtWidgets.QPushButton("Lưu cấu hình")
         self.b_save.setObjectName("save")
         self.b_start = QtWidgets.QPushButton("Start")
@@ -715,14 +740,25 @@ class LVNWindow(QtWidgets.QMainWindow):
         layout.addWidget(header)
 
         body = QtWidgets.QHBoxLayout()
-        body.setSpacing(12)
+        body.setSpacing(10)
         layout.addLayout(body, 1)
 
         left_panel = QtWidgets.QFrame()
-        left_panel.setObjectName("panel")
-        left_layout = QtWidgets.QFormLayout(left_panel)
-        left_layout.setContentsMargins(12, 12, 12, 12)
-        left_layout.setSpacing(10)
+        left_panel.setObjectName("sidebar")
+        left_panel.setMinimumWidth(350)
+        left_panel.setMaximumWidth(390)
+        left_wrap = QtWidgets.QVBoxLayout(left_panel)
+        left_wrap.setContentsMargins(12, 12, 12, 12)
+        left_wrap.setSpacing(10)
+
+        conn_card = QtWidgets.QFrame()
+        conn_card.setObjectName("sectionCard")
+        conn_layout = QtWidgets.QFormLayout(conn_card)
+        conn_layout.setContentsMargins(10, 10, 10, 10)
+        conn_layout.setSpacing(8)
+        conn_title = QtWidgets.QLabel("KẾT NỐI MT5")
+        conn_title.setObjectName("sectionTitle")
+        conn_layout.addRow(conn_title)
 
         self.ed_login = QtWidgets.QLineEdit()
         self.ed_password = QtWidgets.QLineEdit()
@@ -730,8 +766,8 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.ed_server = QtWidgets.QLineEdit()
         self.ed_path = QtWidgets.QLineEdit()
         self.lb_symbol_fixed = QtWidgets.QLabel("XAUUSDc (fixed)")
-        self.lb_symbol_fixed.setObjectName("metric")
-        self.lb_strategy = QtWidgets.QLabel("AUTO: LVN(M5)+EMA filter | Max position = 1")
+        self.lb_symbol_fixed.setObjectName("metricWeak")
+        self.lb_strategy = QtWidgets.QLabel("AUTO: LVN(M5) + EMA filter | Max position = 1")
         self.lb_strategy.setObjectName("sub")
         self.sp_risk = QtWidgets.QDoubleSpinBox()
         self.sp_risk.setRange(0.01, 10.0)
@@ -741,36 +777,74 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.lb_auto_profile = QtWidgets.QLabel("Auto profile: warming up...")
         self.lb_auto_profile.setObjectName("sub")
 
-        left_layout.addRow("MT5 login", self.ed_login)
-        left_layout.addRow("MT5 password", self.ed_password)
-        left_layout.addRow("MT5 server", self.ed_server)
-        left_layout.addRow("Terminal path", self.ed_path)
-        left_layout.addRow("Symbol", self.lb_symbol_fixed)
-        left_layout.addRow("Risk % / lệnh", self.sp_risk)
-        left_layout.addRow("Engine", self.lb_strategy)
-        left_layout.addRow("Auto SL/TP", self.lb_auto_profile)
+        conn_layout.addRow("MT5 login", self.ed_login)
+        conn_layout.addRow("MT5 password", self.ed_password)
+        conn_layout.addRow("MT5 server", self.ed_server)
+        conn_layout.addRow("Terminal path", self.ed_path)
+        conn_layout.addRow("Symbol", self.lb_symbol_fixed)
+        left_wrap.addWidget(conn_card)
 
+        risk_card = QtWidgets.QFrame()
+        risk_card.setObjectName("sectionCard")
+        risk_layout = QtWidgets.QFormLayout(risk_card)
+        risk_layout.setContentsMargins(10, 10, 10, 10)
+        risk_layout.setSpacing(8)
+        risk_title = QtWidgets.QLabel("RỦI RO")
+        risk_title.setObjectName("sectionTitle")
+        risk_layout.addRow(risk_title)
+        risk_layout.addRow("Risk % / lệnh", self.sp_risk)
+        risk_layout.addRow("Engine", self.lb_strategy)
+        risk_layout.addRow("Auto SL/TP", self.lb_auto_profile)
+        left_wrap.addWidget(risk_card)
+        left_wrap.addStretch(1)
         body.addWidget(left_panel, 0)
 
         right_panel = QtWidgets.QFrame()
-        right_panel.setObjectName("panel")
+        right_panel.setObjectName("mainpanel")
         right_layout = QtWidgets.QVBoxLayout(right_panel)
         right_layout.setContentsMargins(12, 12, 12, 12)
-        right_layout.setSpacing(8)
+        right_layout.setSpacing(10)
 
         metric_row = QtWidgets.QHBoxLayout()
         metric_row.setSpacing(8)
-        self.lb_balance = QtWidgets.QLabel("Balance: -")
-        self.lb_equity = QtWidgets.QLabel("Equity: -")
-        self.lb_float = QtWidgets.QLabel("Floating: -")
-        self.lb_positions = QtWidgets.QLabel("Open positions: 0")
-        for w in [self.lb_balance, self.lb_equity, self.lb_float, self.lb_positions]:
-            w.setObjectName("metric")
-            metric_row.addWidget(w, 1)
+
+        def make_metric_card(caption, initial):
+            card = QtWidgets.QFrame()
+            card.setObjectName("metricCard")
+            lay = QtWidgets.QVBoxLayout(card)
+            lay.setContentsMargins(10, 8, 10, 8)
+            cap = QtWidgets.QLabel(caption)
+            cap.setObjectName("caption")
+            val = QtWidgets.QLabel(initial)
+            val.setObjectName("metric")
+            lay.addWidget(cap)
+            lay.addWidget(val)
+            return card, val
+
+        c1, self.lb_balance = make_metric_card("BALANCE", "-")
+        c2, self.lb_equity = make_metric_card("EQUITY", "-")
+        c3, self.lb_float = make_metric_card("FLOATING", "-")
+        c4, self.lb_positions = make_metric_card("OPEN POSITIONS", "0")
+        for c in [c1, c2, c3, c4]:
+            metric_row.addWidget(c, 1)
         right_layout.addLayout(metric_row)
-        self.lb_signal = QtWidgets.QLabel("Last signal: -")
-        self.lb_signal.setObjectName("sub")
-        right_layout.addWidget(self.lb_signal)
+
+        signal_card = QtWidgets.QFrame()
+        signal_card.setObjectName("signalCard")
+        signal_l = QtWidgets.QVBoxLayout(signal_card)
+        signal_l.setContentsMargins(10, 8, 10, 8)
+        sig_cap = QtWidgets.QLabel("SIGNAL")
+        sig_cap.setObjectName("caption")
+        self.lb_signal = QtWidgets.QLabel("-")
+        self.lb_signal.setObjectName("metricWeak")
+        signal_l.addWidget(sig_cap)
+        signal_l.addWidget(self.lb_signal)
+        right_layout.addWidget(signal_card)
+
+        tabs = QtWidgets.QTabWidget()
+        pos_tab = QtWidgets.QWidget()
+        pos_l = QtWidgets.QVBoxLayout(pos_tab)
+        pos_l.setContentsMargins(6, 6, 6, 6)
 
         self.tbl = QtWidgets.QTableWidget(0, 6)
         self.tbl.setHorizontalHeaderLabels(["Ticket", "Side", "Lot", "Open", "P/L", "SL/TP"])
@@ -778,12 +852,18 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl.horizontalHeader().setStretchLastSection(True)
-        right_layout.addWidget(self.tbl, 1)
+        pos_l.addWidget(self.tbl)
+        tabs.addTab(pos_tab, "Positions")
 
+        log_tab = QtWidgets.QWidget()
+        log_l = QtWidgets.QVBoxLayout(log_tab)
+        log_l.setContentsMargins(6, 6, 6, 6)
         self.log_box = QtWidgets.QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.document().setMaximumBlockCount(1200)
-        right_layout.addWidget(self.log_box, 1)
+        log_l.addWidget(self.log_box)
+        tabs.addTab(log_tab, "Event Log")
+        right_layout.addWidget(tabs, 1)
 
         body.addWidget(right_panel, 1)
 
@@ -822,12 +902,14 @@ class LVNWindow(QtWidgets.QMainWindow):
             return
         self._save_cfg()
         self.worker = WorkerHandle(self.cfg, self.event_q)
+        self.lb_runtime_state.setText("STARTING...")
         self._append_log("Worker started", "info")
 
     def _stop(self):
         if self.worker:
             self.worker.stop()
             self.worker = None
+            self.lb_runtime_state.setText("OFFLINE")
             self._append_log("Worker stop requested", "warn")
 
     def _append_log(self, msg, level="info", ts=None):
@@ -841,12 +923,13 @@ class LVNWindow(QtWidgets.QMainWindow):
         eq = float(obj.get("equity", 0.0))
         fl = float(obj.get("floating", 0.0))
         cur = str(obj.get("currency", ""))
-        self.lb_balance.setText(f"Balance: {bal:,.2f} {cur}")
-        self.lb_equity.setText(f"Equity: {eq:,.2f} {cur}")
-        self.lb_float.setText(f"Floating: {fl:+,.2f} {cur}")
-        self.lb_positions.setText(f"Open positions: {int(obj.get('open_positions', 0))}")
-        self.lb_signal.setText(f"Last signal: {obj.get('last_signal', '-')} | {obj.get('signal_reason', '-')}")
+        self.lb_balance.setText(f"{bal:,.2f} {cur}".strip())
+        self.lb_equity.setText(f"{eq:,.2f} {cur}".strip())
+        self.lb_float.setText(f"{fl:+,.2f} {cur}".strip())
+        self.lb_positions.setText(str(int(obj.get("open_positions", 0))))
+        self.lb_signal.setText(f"{obj.get('last_signal', '-')} | {obj.get('signal_reason', '-')}")
         self.lb_auto_profile.setText(f"Auto profile: {obj.get('profile_text', '-')}")
+        self.lb_runtime_state.setText("ONLINE")
 
         positions = obj.get("positions", []) or []
         self.tbl.setRowCount(len(positions))
@@ -868,6 +951,7 @@ class LVNWindow(QtWidgets.QMainWindow):
     def _poll(self):
         if self.worker is not None and not self.worker.is_alive():
             self.worker = None
+            self.lb_runtime_state.setText("OFFLINE")
             self._append_log("Worker exited", "warn")
         for _ in range(300):
             try:
