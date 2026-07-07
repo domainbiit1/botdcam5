@@ -3,8 +3,8 @@
 """EAGoldSuper MT5 Bot (XAUUSDc) with friendly PyQt6 GUI.
 
 Run:
-  python3 EAGoldSuper.py
-  python3 EAGoldSuper.py --worker '{"json":"cfg"}'
+  python3 BOTLVN.py
+  python3 BOTLVN.py --worker '{"json":"cfg"}'
 """
 
 import io
@@ -87,10 +87,18 @@ _stop = threading.Event()
 _send_lock = threading.Lock()
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
+MODE_SCALP_M1_2 = "mode2_m1_pullback"
 MODE_LABELS = {
     MODE_LVN_1: "Mode 1 - LVN Adaptive",
+    MODE_SCALP_M1_2: "Mode 2 - M1 Scalp Pullback",
 }
-DEFAULT_ACTIVE_MODES = [MODE_LVN_1]
+MODE_MAGIC_OFFSETS = {
+    MODE_LVN_1: 11,
+    MODE_SCALP_M1_2: 22,
+}
+DEFAULT_ACTIVE_MODES = [MODE_LVN_1, MODE_SCALP_M1_2]
+
+_today_mode_cache = {}
 
 
 def send(obj):
@@ -194,12 +202,42 @@ def round_lot(lot, sym):
     return max(vmin, min(vmax, q))
 
 
-def my_positions(cfg):
+def mode_magic(cfg, mode):
+    base = int(cfg.get("magic", 700100))
+    return base + int(MODE_MAGIC_OFFSETS.get(mode, 0))
+
+
+def my_positions(cfg, mode=None):
     pos = mt5.positions_get(symbol=cfg["symbol"]) or []
-    magic = int(cfg.get("magic", 0))
+    magic = int(mode_magic(cfg, mode)) if mode else int(cfg.get("magic", 0))
     if magic == 0:
         return list(pos)
     return [p for p in pos if p.magic == magic]
+
+
+def account_positions_all_modes(cfg):
+    pos = mt5.positions_get(symbol=cfg["symbol"]) or []
+    mode_magics = {mode_magic(cfg, m) for m in MODE_LABELS}
+    return [p for p in pos if int(getattr(p, "magic", 0)) in mode_magics]
+
+
+def normalize_mode_settings(cfg):
+    modes = cfg.get("modes", {})
+    if not isinstance(modes, dict):
+        modes = {}
+    for mode in MODE_LABELS:
+        mcfg = modes.get(mode, {})
+        if not isinstance(mcfg, dict):
+            mcfg = {}
+        mcfg.setdefault("enabled", mode in DEFAULT_ACTIVE_MODES)
+        modes[mode] = mcfg
+    cfg["modes"] = modes
+    cfg["active_modes"] = [m for m in MODE_LABELS if modes.get(m, {}).get("enabled", False)]
+    if not cfg["active_modes"]:
+        cfg["active_modes"] = list(DEFAULT_ACTIVE_MODES)
+        for m in cfg["active_modes"]:
+            cfg["modes"][m]["enabled"] = True
+    return cfg
 
 
 def atr_series(df, period=14):
@@ -336,13 +374,72 @@ def compute_lvn_signal(cfg):
 
 
 def get_active_modes(cfg):
-    modes = cfg.get("active_modes", DEFAULT_ACTIVE_MODES)
-    if isinstance(modes, str):
-        modes = [modes]
-    if not isinstance(modes, list):
-        modes = list(DEFAULT_ACTIVE_MODES)
-    cleaned = [m for m in modes if m in MODE_LABELS]
-    return cleaned if cleaned else list(DEFAULT_ACTIVE_MODES)
+    cfg = normalize_mode_settings(cfg)
+    return [m for m in MODE_LABELS if cfg.get("modes", {}).get(m, {}).get("enabled", False)]
+
+
+def compute_mode2_m1_scalp_signal(cfg):
+    bars = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M1, 0, 500)
+    if bars is None or len(bars) < 150:
+        return None
+    df = pd.DataFrame(bars).iloc[:-1].reset_index(drop=True)  # closed bars only
+    if len(df) < 120:
+        return None
+
+    atr_m1 = atr_series(df, 14)
+    ema9 = df["close"].ewm(span=9, adjust=False).mean()
+
+    bars_m5 = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M5, 0, 260)
+    if bars_m5 is None or len(bars_m5) < 100:
+        return None
+    d5 = pd.DataFrame(bars_m5).iloc[:-1].reset_index(drop=True)
+    ema20_m5 = d5["close"].ewm(span=20, adjust=False).mean()
+    ema50_m5 = d5["close"].ewm(span=50, adjust=False).mean()
+    trend_buy = float(ema20_m5.iloc[-1]) > float(ema50_m5.iloc[-1])
+    trend_sell = float(ema20_m5.iloc[-1]) < float(ema50_m5.iloc[-1])
+
+    i = len(df) - 1
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+    a = float(atr_m1.iloc[i]) if float(atr_m1.iloc[i]) > 0 else 0.0
+    if a <= 0:
+        return None
+    e9 = float(ema9.iloc[i])
+    close = float(row["close"])
+    open_ = float(row["open"])
+    low = float(row["low"])
+    high = float(row["high"])
+
+    side = None
+    reason = "no-setup"
+    if trend_buy and low <= e9 and close > e9 and close > open_:
+        side = "BUY"
+        reason = "m1 pullback buy confirm"
+    elif trend_sell and high >= e9 and close < e9 and close < open_:
+        side = "SELL"
+        reason = "m1 pullback sell confirm"
+
+    touch_band = 0.20 * a
+    buy_hint = max(e9, float(prev["close"]) + 0.01)
+    sell_hint = min(e9, float(prev["close"]) - 0.01)
+    buy_hint = buy_hint if buy_hint <= e9 + touch_band else None
+    sell_hint = sell_hint if sell_hint >= e9 - touch_band else None
+
+    atr_hist = atr_m1.iloc[max(0, i - 288): i + 1].dropna().to_numpy(dtype=float)
+    atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist)) if len(atr_hist) >= 8 else 0.5
+    trend_strength = abs(float(ema20_m5.iloc[-1]) - float(ema50_m5.iloc[-1])) / max(1e-9, a)
+
+    return {
+        "side": side,
+        "reason": reason,
+        "m5_time": int(row["time"]),
+        "atr": a,
+        "lvn": e9,
+        "buy_price_hint": buy_hint,
+        "sell_price_hint": sell_hint,
+        "atr_rank": atr_rank,
+        "trend_strength": trend_strength,
+    }
 
 
 def compute_signal_by_modes(cfg):
@@ -353,6 +450,8 @@ def compute_signal_by_modes(cfg):
         payload = None
         if mode == MODE_LVN_1:
             payload = compute_mode1_lvn_signal(cfg)
+        elif mode == MODE_SCALP_M1_2:
+            payload = compute_mode2_m1_scalp_signal(cfg)
         if payload is None:
             continue
         payload["mode"] = mode
@@ -361,6 +460,40 @@ def compute_signal_by_modes(cfg):
         if payload.get("side") in ("BUY", "SELL"):
             return payload
     return first_payload
+
+
+def get_today_mode_stats(cfg, mode):
+    now = time.time()
+    key = (id(cfg), mode)
+    cached = _today_mode_cache.get(key)
+    if cached and now - cached.get("t", 0) < 5:
+        return cached["data"]
+    empty = {"pnl_today": 0.0, "closed_today": 0, "wins": 0, "losses": 0}
+    try:
+        if mt5 is None:
+            return empty
+        start = datetime.combine(datetime.now().date(), datetime.min.time())
+        deals = mt5.history_deals_get(start, datetime.now())
+        if deals is None:
+            _today_mode_cache[key] = {"t": now, "data": empty}
+            return empty
+        magic = mode_magic(cfg, mode)
+        out = dict(empty)
+        for d in deals:
+            if int(getattr(d, "magic", 0)) != int(magic):
+                continue
+            if int(getattr(d, "entry", -1)) == int(mt5.DEAL_ENTRY_OUT):
+                pnl = float(getattr(d, "profit", 0.0) or 0.0) + float(getattr(d, "swap", 0.0) or 0.0) + float(getattr(d, "commission", 0.0) or 0.0)
+                out["pnl_today"] += pnl
+                out["closed_today"] += 1
+                if pnl > 0:
+                    out["wins"] += 1
+                elif pnl < 0:
+                    out["losses"] += 1
+        _today_mode_cache[key] = {"t": now, "data": out}
+        return out
+    except Exception:
+        return empty
 
 
 def lot_from_risk(cfg, stop_distance):
@@ -446,6 +579,7 @@ def open_trade(cfg, side, signal):
         tp = price - stop_dist * rr
         otype = mt5.ORDER_TYPE_SELL
 
+    mode_id = str(signal.get("mode", MODE_LVN_1))
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": cfg["symbol"],
@@ -455,8 +589,8 @@ def open_trade(cfg, side, signal):
         "sl": sl,
         "tp": tp,
         "deviation": int(cfg.get("deviation", 25)),
-        "magic": int(cfg.get("magic", 700100)),
-        "comment": "EAGoldSuper",
+        "magic": int(mode_magic(cfg, mode_id)),
+        "comment": f"EAGoldSuper:{mode_id}",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
@@ -491,12 +625,41 @@ def open_trade(cfg, side, signal):
     return True, "ok"
 
 
-def push_status(cfg, last_signal, signal_reason, profile_text="-", entry_hint="-", active_mode_label="-"):
+def push_status(
+    cfg,
+    last_signal,
+    signal_reason,
+    profile_text="-",
+    entry_hint="-",
+    active_mode_label="-",
+    mode_runtime=None,
+):
     acc = mt5.account_info()
     if acc is None:
         return
-    positions = my_positions(cfg)
+    positions = account_positions_all_modes(cfg)
     floating = float(sum(float(p.profit) for p in positions)) if positions else 0.0
+    mode_runtime = mode_runtime or {}
+    mode_stats = []
+    for mode in MODE_LABELS:
+        mpos = my_positions(cfg, mode)
+        mfloating = float(sum(float(p.profit) for p in mpos)) if mpos else 0.0
+        day = get_today_mode_stats(cfg, mode)
+        rt = mode_runtime.get(mode, {})
+        mode_stats.append(
+            {
+                "id": mode,
+                "label": MODE_LABELS.get(mode, mode),
+                "enabled": bool(cfg.get("modes", {}).get(mode, {}).get("enabled", False)),
+                "open_positions": len(mpos),
+                "floating": mfloating,
+                "pnl_today": float(day.get("pnl_today", 0.0)),
+                "closed_today": int(day.get("closed_today", 0)),
+                "last_signal": str(rt.get("last_signal", "-")),
+                "signal_reason": str(rt.get("signal_reason", "-")),
+                "entry_hint": str(rt.get("entry_hint", "-")),
+            }
+        )
     send(
         {
             "type": "status",
@@ -513,6 +676,7 @@ def push_status(cfg, last_signal, signal_reason, profile_text="-", entry_hint="-
             "profile_text": profile_text,
             "entry_hint": entry_hint,
             "active_mode": active_mode_label,
+            "mode_stats": mode_stats,
             "positions": [
                 {
                     "ticket": int(p.ticket),
@@ -547,6 +711,7 @@ def run_worker(cfg):
     cfg.setdefault("deviation", 25)
     cfg.setdefault("fixed_lot_fallback", 0.01)
     cfg.setdefault("active_modes", list(DEFAULT_ACTIVE_MODES))
+    normalize_mode_settings(cfg)
 
     if not init_mt5(cfg):
         send({"type": "exit", "reason": "mt5 init failed"})
@@ -560,7 +725,15 @@ def run_worker(cfg):
     )
 
     last_status_t = 0.0
-    last_signal_t = 0
+    mode_runtime = {}
+    for mode in MODE_LABELS:
+        mode_runtime[mode] = {
+            "last_time": 0,
+            "last_signal": "-",
+            "signal_reason": "-",
+            "profile_text": f"{MODE_LABELS[mode]}: warming up",
+            "entry_hint": "-",
+        }
     last_signal = "-"
     signal_reason = "-"
     profile_text = "Auto SL/TP: warming up"
@@ -570,38 +743,51 @@ def run_worker(cfg):
     try:
         while not _stop.is_set():
             now = time.time()
-            sig = compute_signal_by_modes(cfg)
-            if sig:
-                mode_id = str(sig.get("mode", MODE_LVN_1))
-                active_mode_label = MODE_LABELS.get(mode_id, mode_id)
-                signal_reason = str(sig.get("reason", ""))
+            enabled_modes = get_active_modes(cfg)
+            active_mode_label = ", ".join(MODE_LABELS.get(m, m) for m in enabled_modes)
+            for mode in enabled_modes:
+                sig = None
+                if mode == MODE_LVN_1:
+                    sig = compute_mode1_lvn_signal(cfg)
+                elif mode == MODE_SCALP_M1_2:
+                    sig = compute_mode2_m1_scalp_signal(cfg)
+                if not sig:
+                    continue
+                sig["mode"] = mode
+                mode_label = MODE_LABELS.get(mode, mode)
                 sig_side = sig.get("side")
                 sig_time = int(sig.get("m5_time") or 0)
-                if sig_side in ("BUY", "SELL"):
-                    last_signal = sig_side
-                else:
-                    last_signal = "WAIT"
+                s_reason = str(sig.get("reason", ""))
                 buy_hint = sig.get("buy_price_hint")
                 sell_hint = sig.get("sell_price_hint")
                 buy_txt = f"Giá {buy_hint:.2f} - Buy" if isinstance(buy_hint, (int, float)) else "Buy: chưa hợp lệ"
                 sell_txt = f"Giá {sell_hint:.2f} - Sell" if isinstance(sell_hint, (int, float)) else "Sell: chưa hợp lệ"
-                entry_hint = f"{sell_txt} | {buy_txt}"
+                hint_text = f"{sell_txt} | {buy_txt}"
+                mode_runtime[mode]["last_signal"] = sig_side if sig_side in ("BUY", "SELL") else "WAIT"
+                mode_runtime[mode]["signal_reason"] = s_reason
+                mode_runtime[mode]["entry_hint"] = hint_text
                 prof = auto_sl_tp_profile(sig)
-                profile_text = (
-                    f"{active_mode_label} | {prof['regime']} | SL={prof['sl_mult']:.2f}ATR | RR={prof['rr']:.2f} | "
+                mode_runtime[mode]["profile_text"] = (
+                    f"{mode_label} | {prof['regime']} | SL={prof['sl_mult']:.2f}ATR | RR={prof['rr']:.2f} | "
                     f"atrRank={prof['atr_rank']:.0%} trend={prof['trend_strength']:.2f}"
                 )
 
-                if sig_time > 0 and sig_time != last_signal_t:
-                    last_signal_t = sig_time
-                    positions = my_positions(cfg)
+                if sig_side in ("BUY", "SELL"):
+                    last_signal = f"{mode_label}: {sig_side}"
+                    signal_reason = s_reason
+                    profile_text = mode_runtime[mode]["profile_text"]
+                    entry_hint = hint_text
+
+                if sig_time > 0 and sig_time != int(mode_runtime[mode]["last_time"]):
+                    mode_runtime[mode]["last_time"] = sig_time
+                    positions = my_positions(cfg, mode)
                     if len(positions) < int(cfg.get("max_positions", 1)) and sig_side in ("BUY", "SELL"):
                         ok, reason = open_trade(cfg, sig_side, sig)
                         if not ok:
-                            log(f"Skip open {sig_side}: {reason}", "warn")
+                            log(f"[{mode_label}] Skip open {sig_side}: {reason}", "warn")
                     else:
                         if sig_side in ("BUY", "SELL"):
-                            log(f"Signal {sig_side} but max_positions reached ({len(positions)})", "info")
+                            log(f"[{mode_label}] Signal {sig_side} but max_positions reached ({len(positions)})", "info")
 
             if now - last_status_t >= 1.0:
                 push_status(
@@ -611,6 +797,7 @@ def run_worker(cfg):
                     profile_text=profile_text,
                     entry_hint=entry_hint,
                     active_mode_label=active_mode_label,
+                    mode_runtime=mode_runtime,
                 )
                 last_status_t = now
 
@@ -771,6 +958,7 @@ class LVNWindow(QtWidgets.QMainWindow):
             "symbol": "XAUUSDc",
             "magic": 700100,
             "active_modes": list(DEFAULT_ACTIVE_MODES),
+            "modes": {m: {"enabled": (m in DEFAULT_ACTIVE_MODES)} for m in MODE_LABELS},
             "risk_pct": 0.5,
             "max_positions": 1,
             "lvn_window": 144,
@@ -783,6 +971,7 @@ class LVNWindow(QtWidgets.QMainWindow):
             "deviation": 25,
         }
         self.cfg.update(load_cfg())
+        normalize_mode_settings(self.cfg)
         self._build_ui()
         self._apply_cfg_to_ui()
         self.timer = QTimer(self)
@@ -881,6 +1070,18 @@ class LVNWindow(QtWidgets.QMainWindow):
         risk_layout.addRow("Risk % / lệnh", self.sp_risk)
         risk_layout.addRow("Engine", self.lb_strategy)
         risk_layout.addRow("Auto SL/TP", self.lb_auto_profile)
+        self.mode_widgets = {}
+        for mode, label in MODE_LABELS.items():
+            box = QtWidgets.QHBoxLayout()
+            cb = QtWidgets.QCheckBox(label)
+            pnl = QtWidgets.QLabel("PnL today: 0.00")
+            pnl.setObjectName("sub")
+            box.addWidget(cb, 1)
+            box.addWidget(pnl, 0, Qt.AlignmentFlag.AlignRight)
+            wrap = QtWidgets.QWidget()
+            wrap.setLayout(box)
+            risk_layout.addRow(wrap)
+            self.mode_widgets[mode] = {"checkbox": cb, "pnl": pnl}
         left_wrap.addWidget(risk_card)
         left_wrap.addStretch(1)
         body.addWidget(left_panel, 0)
@@ -961,7 +1162,17 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.b_stop.clicked.connect(self._stop)
 
     def _collect_cfg(self):
-        existing_modes = get_active_modes(self.cfg)
+        mode_cfg = {}
+        for mode in MODE_LABELS:
+            w = self.mode_widgets.get(mode, {})
+            enabled = bool(w.get("checkbox").isChecked()) if w else (mode in DEFAULT_ACTIVE_MODES)
+            mode_cfg[mode] = {"enabled": enabled}
+        active_modes = [m for m in MODE_LABELS if mode_cfg[m]["enabled"]]
+        if not active_modes:
+            # Always keep at least one mode active for user safety.
+            first = list(MODE_LABELS.keys())[0]
+            mode_cfg[first]["enabled"] = True
+            active_modes = [first]
         return {
             "login": self.ed_login.text().strip(),
             "password": self.ed_password.text().strip(),
@@ -969,7 +1180,8 @@ class LVNWindow(QtWidgets.QMainWindow):
             "path": self.ed_path.text().strip(),
             "symbol": "XAUUSDc",
             "magic": int(self.cfg.get("magic", 700100)),
-            "active_modes": existing_modes,
+            "modes": mode_cfg,
+            "active_modes": active_modes,
             "risk_pct": float(self.sp_risk.value()),
         }
 
@@ -982,11 +1194,15 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.sp_risk.setValue(float(c.get("risk_pct", 0.5)))
         mode_labels = [MODE_LABELS.get(m, m) for m in get_active_modes(c)]
         self.lb_strategy.setText(f"ACTIVE: {', '.join(mode_labels)} | Max position = 1")
+        for mode, w in self.mode_widgets.items():
+            enabled = bool(c.get("modes", {}).get(mode, {}).get("enabled", mode in DEFAULT_ACTIVE_MODES))
+            w["checkbox"].setChecked(enabled)
+            w["pnl"].setText("PnL today: 0.00")
 
     def _save_cfg(self):
         merged = dict(self.cfg)
         merged.update(self._collect_cfg())
-        self.cfg = merged
+        self.cfg = normalize_mode_settings(merged)
         save_cfg(self.cfg)
         self._append_log("Config saved", "info")
 
@@ -1025,6 +1241,12 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.lb_auto_profile.setText(f"Auto profile: {obj.get('profile_text', '-')}")
         self.lb_strategy.setText(f"ACTIVE: {obj.get('active_mode', 'Mode 1 - LVN Adaptive')} | Max position = 1")
         self.lb_runtime_state.setText("ONLINE")
+        for m in obj.get("mode_stats", []) or []:
+            mode = str(m.get("id", ""))
+            if mode in self.mode_widgets:
+                self.mode_widgets[mode]["pnl"].setText(
+                    f"PnL today: {float(m.get('pnl_today', 0.0)):+.2f} | Open: {int(m.get('open_positions', 0))}"
+                )
 
         positions = obj.get("positions", []) or []
         self.tbl.setRowCount(len(positions))
