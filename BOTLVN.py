@@ -658,6 +658,9 @@ def push_status(
                 "last_signal": str(rt.get("last_signal", "-")),
                 "signal_reason": str(rt.get("signal_reason", "-")),
                 "entry_hint": str(rt.get("entry_hint", "-")),
+                "buy_hint": rt.get("buy_hint"),
+                "sell_hint": rt.get("sell_hint"),
+                "profile_text": str(rt.get("profile_text", "-")),
             }
         )
     send(
@@ -733,6 +736,8 @@ def run_worker(cfg):
             "signal_reason": "-",
             "profile_text": f"{MODE_LABELS[mode]}: warming up",
             "entry_hint": "-",
+            "buy_hint": None,
+            "sell_hint": None,
         }
     last_signal = "-"
     signal_reason = "-"
@@ -766,6 +771,8 @@ def run_worker(cfg):
                 mode_runtime[mode]["last_signal"] = sig_side if sig_side in ("BUY", "SELL") else "WAIT"
                 mode_runtime[mode]["signal_reason"] = s_reason
                 mode_runtime[mode]["entry_hint"] = hint_text
+                mode_runtime[mode]["buy_hint"] = buy_hint if isinstance(buy_hint, (int, float)) else None
+                mode_runtime[mode]["sell_hint"] = sell_hint if isinstance(sell_hint, (int, float)) else None
                 prof = auto_sl_tp_profile(sig)
                 mode_runtime[mode]["profile_text"] = (
                     f"{mode_label} | {prof['regime']} | SL={prof['sl_mult']:.2f}ATR | RR={prof['rr']:.2f} | "
@@ -1140,13 +1147,27 @@ class LVNWindow(QtWidgets.QMainWindow):
         signal_l.setContentsMargins(10, 8, 10, 8)
         sig_cap = QtWidgets.QLabel("SIGNAL")
         sig_cap.setObjectName("caption")
-        self.lb_signal = QtWidgets.QLabel("-")
+        self.lb_signal = QtWidgets.QLabel("Đang chờ dữ liệu...")
         self.lb_signal.setObjectName("metricWeak")
-        self.lb_entry_hint = QtWidgets.QLabel("Giá xxxx - Sell | Giá xxxx - Buy")
-        self.lb_entry_hint.setObjectName("sub")
+        self.signal_tbl = QtWidgets.QTableWidget(0, 5)
+        self.signal_tbl.setHorizontalHeaderLabels(["Mode", "State", "Sell", "Buy", "Reason"])
+        self.signal_tbl.verticalHeader().setVisible(False)
+        self.signal_tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.signal_tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.signal_tbl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.signal_tbl.setAlternatingRowColors(True)
+        self.signal_tbl.horizontalHeader().setStretchLastSection(True)
+        self.signal_tbl.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.signal_tbl.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.signal_tbl.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.signal_tbl.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.signal_tbl.setColumnWidth(0, 205)
+        self.signal_tbl.setColumnWidth(1, 85)
+        self.signal_tbl.setColumnWidth(2, 110)
+        self.signal_tbl.setColumnWidth(3, 110)
         signal_l.addWidget(sig_cap)
         signal_l.addWidget(self.lb_signal)
-        signal_l.addWidget(self.lb_entry_hint)
+        signal_l.addWidget(self.signal_tbl)
         right_layout.addWidget(signal_card)
 
         tabs = QtWidgets.QTabWidget()
@@ -1254,14 +1275,36 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.lb_equity.setText(f"{eq:,.2f} {cur}".strip())
         self.lb_float.setText(f"{fl:+,.2f} {cur}".strip())
         self.lb_positions.setText(str(int(obj.get("open_positions", 0))))
-        signal_text = str(obj.get("last_signal", "-")).strip() or "-"
-        reason_text = str(obj.get("signal_reason", "-")).strip() or "-"
-        entry_text = str(obj.get("entry_hint", "-")).strip() or "-"
-        self.lb_signal.setText(f"{signal_text}\n{reason_text}")
-        self.lb_entry_hint.setText(entry_text)
+        self.lb_signal.setText(f"Signal realtime theo mode (M5/M1 closed bars) | Active: {obj.get('active_mode', '-')}")
         self.lb_auto_profile.setText(f"Auto profile: {obj.get('profile_text', '-')}")
         self.lb_strategy.setText(f"ACTIVE: {obj.get('active_mode', 'Mode 1 - LVN Adaptive')} | Max position = 1")
         self.lb_runtime_state.setText("ONLINE")
+        mode_stats = obj.get("mode_stats", []) or []
+        self.signal_tbl.setRowCount(len(mode_stats))
+        for r, m in enumerate(mode_stats):
+            state = str(m.get("last_signal", "-"))
+            if state == "BUY":
+                state_color = "#22c55e"
+            elif state == "SELL":
+                state_color = "#ef4444"
+            else:
+                state_color = "#a5b4cf"
+            buy_hint = m.get("buy_hint")
+            sell_hint = m.get("sell_hint")
+            buy_txt = f"{float(buy_hint):.2f}" if isinstance(buy_hint, (int, float)) else "-"
+            sell_txt = f"{float(sell_hint):.2f}" if isinstance(sell_hint, (int, float)) else "-"
+            reason = str(m.get("signal_reason", "-"))
+            vals = [str(m.get("label", m.get("id", "-"))), state, sell_txt, buy_txt, reason]
+            for c, v in enumerate(vals):
+                it = QtWidgets.QTableWidgetItem(v)
+                if c in (2, 3):
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                elif c == 1:
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if c == 1:
+                    it.setForeground(QtGui.QColor(state_color))
+                self.signal_tbl.setItem(r, c, it)
+            self.signal_tbl.setRowHeight(r, 28)
         for m in obj.get("mode_stats", []) or []:
             mode = str(m.get("id", ""))
             if mode in self.mode_widgets:
