@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""LVN MT5 Bot (XAUUSDc) with friendly PyQt6 GUI.
+"""EAGoldSuper MT5 Bot (XAUUSDc) with friendly PyQt6 GUI.
 
 Run:
-  python3 BOTLVN.py
-  python3 BOTLVN.py --worker '{"json":"cfg"}'
+  python3 EAGoldSuper.py
+  python3 EAGoldSuper.py --worker '{"json":"cfg"}'
 """
 
 import io
@@ -85,6 +85,12 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
+
+MODE_LVN_1 = "mode1_lvn_adaptive"
+MODE_LABELS = {
+    MODE_LVN_1: "Mode 1 - LVN Adaptive",
+}
+DEFAULT_ACTIVE_MODES = [MODE_LVN_1]
 
 
 def send(obj):
@@ -230,7 +236,7 @@ def nearest_level(levels, px):
     return min(levels, key=lambda x: abs(x - px))
 
 
-def compute_lvn_signal(cfg):
+def compute_mode1_lvn_signal(cfg):
     bars_needed = max(int(cfg.get("lvn_window", 144)) + 80, 300)
     bars = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M5, 0, bars_needed)
     if bars is None or len(bars) < bars_needed // 2:
@@ -322,6 +328,39 @@ def compute_lvn_signal(cfg):
         "atr_rank": atr_rank,
         "trend_strength": trend_strength,
     }
+
+
+def compute_lvn_signal(cfg):
+    """Backward-compatible alias for mode 1 LVN signal."""
+    return compute_mode1_lvn_signal(cfg)
+
+
+def get_active_modes(cfg):
+    modes = cfg.get("active_modes", DEFAULT_ACTIVE_MODES)
+    if isinstance(modes, str):
+        modes = [modes]
+    if not isinstance(modes, list):
+        modes = list(DEFAULT_ACTIVE_MODES)
+    cleaned = [m for m in modes if m in MODE_LABELS]
+    return cleaned if cleaned else list(DEFAULT_ACTIVE_MODES)
+
+
+def compute_signal_by_modes(cfg):
+    """Multi-mode dispatcher. Currently supports Mode 1 LVN."""
+    active_modes = get_active_modes(cfg)
+    first_payload = None
+    for mode in active_modes:
+        payload = None
+        if mode == MODE_LVN_1:
+            payload = compute_mode1_lvn_signal(cfg)
+        if payload is None:
+            continue
+        payload["mode"] = mode
+        if first_payload is None:
+            first_payload = payload
+        if payload.get("side") in ("BUY", "SELL"):
+            return payload
+    return first_payload
 
 
 def lot_from_risk(cfg, stop_distance):
@@ -417,7 +456,7 @@ def open_trade(cfg, side, signal):
         "tp": tp,
         "deviation": int(cfg.get("deviation", 25)),
         "magic": int(cfg.get("magic", 700100)),
-        "comment": "LVN",
+        "comment": "EAGoldSuper",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
@@ -441,6 +480,7 @@ def open_trade(cfg, side, signal):
             "sl_mult": sl_atr,
             "rr": rr,
             "regime": profile["regime"],
+            "mode": signal.get("mode", MODE_LVN_1),
             "ts": datetime.now().strftime("%H:%M:%S"),
         }
     )
@@ -451,7 +491,7 @@ def open_trade(cfg, side, signal):
     return True, "ok"
 
 
-def push_status(cfg, last_signal, signal_reason, profile_text="-", entry_hint="-"):
+def push_status(cfg, last_signal, signal_reason, profile_text="-", entry_hint="-", active_mode_label="-"):
     acc = mt5.account_info()
     if acc is None:
         return
@@ -472,6 +512,7 @@ def push_status(cfg, last_signal, signal_reason, profile_text="-", entry_hint="-
             "signal_reason": signal_reason,
             "profile_text": profile_text,
             "entry_hint": entry_hint,
+            "active_mode": active_mode_label,
             "positions": [
                 {
                     "ticket": int(p.ticket),
@@ -505,13 +546,18 @@ def run_worker(cfg):
     cfg.setdefault("atr_regime_window", 288)
     cfg.setdefault("deviation", 25)
     cfg.setdefault("fixed_lot_fallback", 0.01)
+    cfg.setdefault("active_modes", list(DEFAULT_ACTIVE_MODES))
 
     if not init_mt5(cfg):
         send({"type": "exit", "reason": "mt5 init failed"})
         return
 
     threading.Thread(target=_stdin_watch, daemon=True).start()
-    log(f"LVN bot started | symbol={cfg['symbol']} | risk={cfg['risk_pct']}% | auto SL/TP by M5 regime")
+    active_mode_labels = [MODE_LABELS.get(m, m) for m in get_active_modes(cfg)]
+    log(
+        f"EAGoldSuper started | symbol={cfg['symbol']} | risk={cfg['risk_pct']}% | "
+        f"active_modes={', '.join(active_mode_labels)} | auto SL/TP by M5 regime"
+    )
 
     last_status_t = 0.0
     last_signal_t = 0
@@ -519,12 +565,15 @@ def run_worker(cfg):
     signal_reason = "-"
     profile_text = "Auto SL/TP: warming up"
     entry_hint = "-"
+    active_mode_label = ", ".join(active_mode_labels)
 
     try:
         while not _stop.is_set():
             now = time.time()
-            sig = compute_lvn_signal(cfg)
+            sig = compute_signal_by_modes(cfg)
             if sig:
+                mode_id = str(sig.get("mode", MODE_LVN_1))
+                active_mode_label = MODE_LABELS.get(mode_id, mode_id)
                 signal_reason = str(sig.get("reason", ""))
                 sig_side = sig.get("side")
                 sig_time = int(sig.get("m5_time") or 0)
@@ -539,7 +588,7 @@ def run_worker(cfg):
                 entry_hint = f"{sell_txt} | {buy_txt}"
                 prof = auto_sl_tp_profile(sig)
                 profile_text = (
-                    f"{prof['regime']} | SL={prof['sl_mult']:.2f}ATR | RR={prof['rr']:.2f} | "
+                    f"{active_mode_label} | {prof['regime']} | SL={prof['sl_mult']:.2f}ATR | RR={prof['rr']:.2f} | "
                     f"atrRank={prof['atr_rank']:.0%} trend={prof['trend_strength']:.2f}"
                 )
 
@@ -561,6 +610,7 @@ def run_worker(cfg):
                     signal_reason,
                     profile_text=profile_text,
                     entry_hint=entry_hint,
+                    active_mode_label=active_mode_label,
                 )
                 last_status_t = now
 
@@ -643,7 +693,7 @@ class WorkerHandle:
                 pass
 
 
-CFG_FILE = Path(__file__).resolve().with_name("bot_lvn_config.json")
+CFG_FILE = Path(__file__).resolve().with_name("eagoldsuper_config.json")
 
 
 def load_cfg():
@@ -712,7 +762,7 @@ QHeaderView::section { background:#132644; color:#d6e6ff; border:none; padding:7
 class LVNWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LVN Bot MT5 - XAUUSDc")
+        self.setWindowTitle("EAGoldSuper - MT5 Multi-Mode")
         self.resize(1180, 760)
         self.worker = None
         self.event_q = queue.Queue()
@@ -720,6 +770,7 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.cfg = {
             "symbol": "XAUUSDc",
             "magic": 700100,
+            "active_modes": list(DEFAULT_ACTIVE_MODES),
             "risk_pct": 0.5,
             "max_positions": 1,
             "lvn_window": 144,
@@ -750,9 +801,9 @@ class LVNWindow(QtWidgets.QMainWindow):
         h = QtWidgets.QHBoxLayout(header)
         h.setContentsMargins(16, 12, 16, 12)
         h.setSpacing(10)
-        title = QtWidgets.QLabel("LVN BOT PRO")
+        title = QtWidgets.QLabel("EAGoldSuper")
         title.setObjectName("title")
-        subtitle = QtWidgets.QLabel("TP/SL tự động theo M5 regime · User chỉ chỉnh Risk %/lệnh")
+        subtitle = QtWidgets.QLabel("Multi-mode trading engine · Mode 1 (LVN Adaptive) đang bật")
         subtitle.setObjectName("sub")
         left = QtWidgets.QVBoxLayout()
         left.setSpacing(2)
@@ -802,7 +853,7 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.ed_path = QtWidgets.QLineEdit()
         self.lb_symbol_fixed = QtWidgets.QLabel("XAUUSDc (fixed)")
         self.lb_symbol_fixed.setObjectName("metricWeak")
-        self.lb_strategy = QtWidgets.QLabel("AUTO: LVN(M5) + EMA filter | Max position = 1")
+        self.lb_strategy = QtWidgets.QLabel("ACTIVE: Mode 1 - LVN Adaptive | Max position = 1")
         self.lb_strategy.setObjectName("sub")
         self.sp_risk = QtWidgets.QDoubleSpinBox()
         self.sp_risk.setRange(0.01, 10.0)
@@ -910,6 +961,7 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.b_stop.clicked.connect(self._stop)
 
     def _collect_cfg(self):
+        existing_modes = get_active_modes(self.cfg)
         return {
             "login": self.ed_login.text().strip(),
             "password": self.ed_password.text().strip(),
@@ -917,6 +969,7 @@ class LVNWindow(QtWidgets.QMainWindow):
             "path": self.ed_path.text().strip(),
             "symbol": "XAUUSDc",
             "magic": int(self.cfg.get("magic", 700100)),
+            "active_modes": existing_modes,
             "risk_pct": float(self.sp_risk.value()),
         }
 
@@ -927,6 +980,8 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.ed_server.setText(str(c.get("server", "")))
         self.ed_path.setText(str(c.get("path", "")))
         self.sp_risk.setValue(float(c.get("risk_pct", 0.5)))
+        mode_labels = [MODE_LABELS.get(m, m) for m in get_active_modes(c)]
+        self.lb_strategy.setText(f"ACTIVE: {', '.join(mode_labels)} | Max position = 1")
 
     def _save_cfg(self):
         merged = dict(self.cfg)
@@ -968,6 +1023,7 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.lb_signal.setText(f"{obj.get('last_signal', '-')} | {obj.get('signal_reason', '-')}")
         self.lb_entry_hint.setText(str(obj.get("entry_hint", "-")))
         self.lb_auto_profile.setText(f"Auto profile: {obj.get('profile_text', '-')}")
+        self.lb_strategy.setText(f"ACTIVE: {obj.get('active_mode', 'Mode 1 - LVN Adaptive')} | Max position = 1")
         self.lb_runtime_state.setText("ONLINE")
 
         positions = obj.get("positions", []) or []
