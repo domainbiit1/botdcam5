@@ -789,6 +789,24 @@ def run_worker(cfg):
                         if sig_side in ("BUY", "SELL"):
                             log(f"[{mode_label}] Signal {sig_side} but max_positions reached ({len(positions)})", "info")
 
+            # Always expose signal state per enabled mode (even WAIT), so GUI
+            # never looks blank while waiting for setups.
+            if enabled_modes:
+                state_parts = []
+                reason_parts = []
+                hint_parts = []
+                for m in enabled_modes:
+                    label = MODE_LABELS.get(m, m)
+                    m_sig = str(mode_runtime.get(m, {}).get("last_signal", "-"))
+                    m_reason = str(mode_runtime.get(m, {}).get("signal_reason", "-"))
+                    m_hint = str(mode_runtime.get(m, {}).get("entry_hint", "-"))
+                    state_parts.append(f"{label}: {m_sig}")
+                    reason_parts.append(f"{label}: {m_reason}")
+                    hint_parts.append(f"{label}: {m_hint}")
+                last_signal = " | ".join(state_parts)
+                signal_reason = " | ".join(reason_parts)
+                entry_hint = " || ".join(hint_parts)
+
             if now - last_status_t >= 1.0:
                 push_status(
                     cfg,
@@ -1236,8 +1254,11 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.lb_equity.setText(f"{eq:,.2f} {cur}".strip())
         self.lb_float.setText(f"{fl:+,.2f} {cur}".strip())
         self.lb_positions.setText(str(int(obj.get("open_positions", 0))))
-        self.lb_signal.setText(f"{obj.get('last_signal', '-')} | {obj.get('signal_reason', '-')}")
-        self.lb_entry_hint.setText(str(obj.get("entry_hint", "-")))
+        signal_text = str(obj.get("last_signal", "-")).strip() or "-"
+        reason_text = str(obj.get("signal_reason", "-")).strip() or "-"
+        entry_text = str(obj.get("entry_hint", "-")).strip() or "-"
+        self.lb_signal.setText(f"{signal_text}\n{reason_text}")
+        self.lb_entry_hint.setText(entry_text)
         self.lb_auto_profile.setText(f"Auto profile: {obj.get('profile_text', '-')}")
         self.lb_strategy.setText(f"ACTIVE: {obj.get('active_mode', 'Mode 1 - LVN Adaptive')} | Max position = 1")
         self.lb_runtime_state.setText("ONLINE")
