@@ -1155,7 +1155,7 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.signal_tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.signal_tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self.signal_tbl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.signal_tbl.setAlternatingRowColors(True)
+        self.signal_tbl.setAlternatingRowColors(False)
         self.signal_tbl.horizontalHeader().setStretchLastSection(True)
         self.signal_tbl.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
         self.signal_tbl.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
@@ -1301,8 +1301,13 @@ class LVNWindow(QtWidgets.QMainWindow):
                     it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 elif c == 1:
                     it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                # Keep table readable in all themes/states.
+                bg = "#0a1324" if (r % 2 == 0) else "#0c1730"
+                it.setBackground(QtGui.QColor(bg))
                 if c == 1:
                     it.setForeground(QtGui.QColor(state_color))
+                else:
+                    it.setForeground(QtGui.QColor("#dbe8ff"))
                 self.signal_tbl.setItem(r, c, it)
             self.signal_tbl.setRowHeight(r, 28)
         for m in obj.get("mode_stats", []) or []:
