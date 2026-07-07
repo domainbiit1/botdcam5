@@ -261,7 +261,25 @@ def compute_lvn_signal(cfg):
     if lvl is None:
         return None
 
-    touch_ok = abs(float(row["close"]) - lvl) <= float(cfg.get("touch_atr", 0.30)) * a
+    touch_dist = float(cfg.get("touch_atr", 0.30)) * a
+    touch_ok = abs(float(row["close"]) - lvl) <= touch_dist
+    price_step = 0.01
+    try:
+        info = mt5.symbol_info(cfg["symbol"])
+        if info is not None:
+            price_step = max(0.0001, float(getattr(info, "point", 0.01) or 0.01))
+    except Exception:
+        pass
+    # Entry guide cho user:
+    #   BUY: can close >= LVN va > close truoc
+    #   SELL: can close <= LVN va < close truoc
+    # Dong thoi van nam trong vung touch quanh LVN.
+    buy_raw = max(float(lvl), float(prev["close"]) + price_step)
+    sell_raw = min(float(lvl), float(prev["close"]) - price_step)
+    buy_upper = float(lvl) + touch_dist
+    sell_lower = float(lvl) - touch_dist
+    buy_price_hint = buy_raw if buy_raw <= buy_upper else None
+    sell_price_hint = sell_raw if sell_raw >= sell_lower else None
     if not touch_ok:
         return {
             "side": None,
@@ -269,6 +287,8 @@ def compute_lvn_signal(cfg):
             "m5_time": int(row["time"]),
             "atr": a,
             "lvn": lvl,
+            "buy_price_hint": buy_price_hint,
+            "sell_price_hint": sell_price_hint,
         }
 
     side = None
@@ -297,6 +317,8 @@ def compute_lvn_signal(cfg):
         "m5_time": int(row["time"]),
         "atr": a,
         "lvn": lvl,
+        "buy_price_hint": buy_price_hint,
+        "sell_price_hint": sell_price_hint,
         "atr_rank": atr_rank,
         "trend_strength": trend_strength,
     }
@@ -429,7 +451,7 @@ def open_trade(cfg, side, signal):
     return True, "ok"
 
 
-def push_status(cfg, last_signal, signal_reason, profile_text="-"):
+def push_status(cfg, last_signal, signal_reason, profile_text="-", entry_hint="-"):
     acc = mt5.account_info()
     if acc is None:
         return
@@ -449,6 +471,7 @@ def push_status(cfg, last_signal, signal_reason, profile_text="-"):
             "last_signal": last_signal,
             "signal_reason": signal_reason,
             "profile_text": profile_text,
+            "entry_hint": entry_hint,
             "positions": [
                 {
                     "ticket": int(p.ticket),
@@ -495,6 +518,7 @@ def run_worker(cfg):
     last_signal = "-"
     signal_reason = "-"
     profile_text = "Auto SL/TP: warming up"
+    entry_hint = "-"
 
     try:
         while not _stop.is_set():
@@ -508,6 +532,11 @@ def run_worker(cfg):
                     last_signal = sig_side
                 else:
                     last_signal = "WAIT"
+                buy_hint = sig.get("buy_price_hint")
+                sell_hint = sig.get("sell_price_hint")
+                buy_txt = f"Giá {buy_hint:.2f} - Buy" if isinstance(buy_hint, (int, float)) else "Buy: chưa hợp lệ"
+                sell_txt = f"Giá {sell_hint:.2f} - Sell" if isinstance(sell_hint, (int, float)) else "Sell: chưa hợp lệ"
+                entry_hint = f"{sell_txt} | {buy_txt}"
                 prof = auto_sl_tp_profile(sig)
                 profile_text = (
                     f"{prof['regime']} | SL={prof['sl_mult']:.2f}ATR | RR={prof['rr']:.2f} | "
@@ -526,7 +555,13 @@ def run_worker(cfg):
                             log(f"Signal {sig_side} but max_positions reached ({len(positions)})", "info")
 
             if now - last_status_t >= 1.0:
-                push_status(cfg, last_signal, signal_reason, profile_text=profile_text)
+                push_status(
+                    cfg,
+                    last_signal,
+                    signal_reason,
+                    profile_text=profile_text,
+                    entry_hint=entry_hint,
+                )
                 last_status_t = now
 
             time.sleep(0.2)
@@ -837,8 +872,11 @@ class LVNWindow(QtWidgets.QMainWindow):
         sig_cap.setObjectName("caption")
         self.lb_signal = QtWidgets.QLabel("-")
         self.lb_signal.setObjectName("metricWeak")
+        self.lb_entry_hint = QtWidgets.QLabel("Giá xxxx - Sell | Giá xxxx - Buy")
+        self.lb_entry_hint.setObjectName("sub")
         signal_l.addWidget(sig_cap)
         signal_l.addWidget(self.lb_signal)
+        signal_l.addWidget(self.lb_entry_hint)
         right_layout.addWidget(signal_card)
 
         tabs = QtWidgets.QTabWidget()
@@ -928,6 +966,7 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.lb_float.setText(f"{fl:+,.2f} {cur}".strip())
         self.lb_positions.setText(str(int(obj.get("open_positions", 0))))
         self.lb_signal.setText(f"{obj.get('last_signal', '-')} | {obj.get('signal_reason', '-')}")
+        self.lb_entry_hint.setText(str(obj.get("entry_hint", "-")))
         self.lb_auto_profile.setText(f"Auto profile: {obj.get('profile_text', '-')}")
         self.lb_runtime_state.setText("ONLINE")
 
