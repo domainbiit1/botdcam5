@@ -16,7 +16,6 @@ import sys
 import threading
 import time
 import traceback
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -283,12 +282,23 @@ def compute_lvn_signal(cfg):
     else:
         reason = "trend-not-confirmed"
 
+    # Volatility regime by ATR percentile in a rolling M5 window.
+    atr_lookback = int(cfg.get("atr_regime_window", 288))
+    atr_hist = atr.iloc[max(0, i - atr_lookback): i + 1].dropna().to_numpy(dtype=float)
+    if len(atr_hist) >= 8:
+        atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist))
+    else:
+        atr_rank = 0.5
+    trend_strength = abs(float(ema_fast.iloc[i]) - float(ema_slow.iloc[i])) / max(1e-9, a)
+
     return {
         "side": side,
         "reason": reason,
         "m5_time": int(row["time"]),
         "atr": a,
         "lvn": lvl,
+        "atr_rank": atr_rank,
+        "trend_strength": trend_strength,
     }
 
 
@@ -319,15 +329,48 @@ def lot_from_risk(cfg, stop_distance):
     return round_lot(raw_lot, info)
 
 
-def open_trade(cfg, side, atr_now):
+def auto_sl_tp_profile(signal):
+    """Auto derive SL/TP profile from M5 volatility regime + trend strength."""
+    atr_rank = float(signal.get("atr_rank", 0.5))
+    trend_strength = float(signal.get("trend_strength", 0.0))
+
+    if atr_rank < 0.35:
+        sl_mult, rr = 1.15, 1.55
+        regime = "CALM"
+    elif atr_rank < 0.75:
+        sl_mult, rr = 1.35, 1.85
+        regime = "NORMAL"
+    else:
+        sl_mult, rr = 1.75, 2.20
+        regime = "VOLATILE"
+
+    # Favor stronger trend continuation with slightly larger reward target.
+    if trend_strength >= 1.20:
+        rr = min(2.60, rr + 0.20)
+    elif trend_strength <= 0.45 and atr_rank >= 0.75:
+        # Very noisy/choppy high-vol regime: avoid over-optimistic TP.
+        rr = max(1.90, rr - 0.20)
+
+    return {
+        "sl_mult": float(sl_mult),
+        "rr": float(rr),
+        "regime": regime,
+        "atr_rank": atr_rank,
+        "trend_strength": trend_strength,
+    }
+
+
+def open_trade(cfg, side, signal):
     info = mt5.symbol_info(cfg["symbol"])
     tick = mt5.symbol_info_tick(cfg["symbol"])
     if info is None or tick is None:
         return False, "symbol/tick unavailable"
 
-    sl_atr = max(0.2, float(cfg.get("sl_atr_mult", 1.4)))
-    rr = max(0.5, float(cfg.get("rr", 1.8)))
-    stop_dist = sl_atr * max(1e-9, float(atr_now))
+    atr_now = max(1e-9, float(signal.get("atr", 0.0)))
+    profile = auto_sl_tp_profile(signal)
+    sl_atr = max(0.2, float(profile["sl_mult"]))
+    rr = max(0.5, float(profile["rr"]))
+    stop_dist = sl_atr * atr_now
     lot = lot_from_risk(cfg, stop_dist)
     if lot <= 0:
         return False, "lot <= 0"
@@ -373,14 +416,20 @@ def open_trade(cfg, side, atr_now):
             "sl": sl,
             "tp": tp,
             "ticket": getattr(res, "order", 0),
+            "sl_mult": sl_atr,
+            "rr": rr,
+            "regime": profile["regime"],
             "ts": datetime.now().strftime("%H:%M:%S"),
         }
     )
-    log(f"OPEN {side} lot={lot:.2f} @ {price:.2f} SL={sl:.2f} TP={tp:.2f}")
+    log(
+        f"OPEN {side} lot={lot:.2f} @ {price:.2f} SL={sl:.2f} TP={tp:.2f} | "
+        f"autoSL={sl_atr:.2f}ATR autoRR={rr:.2f} ({profile['regime']})"
+    )
     return True, "ok"
 
 
-def push_status(cfg, last_signal, signal_reason):
+def push_status(cfg, last_signal, signal_reason, profile_text="-"):
     acc = mt5.account_info()
     if acc is None:
         return
@@ -399,6 +448,7 @@ def push_status(cfg, last_signal, signal_reason):
             "open_positions": len(positions),
             "last_signal": last_signal,
             "signal_reason": signal_reason,
+            "profile_text": profile_text,
             "positions": [
                 {
                     "ticket": int(p.ticket),
@@ -423,14 +473,13 @@ def run_worker(cfg):
     cfg.setdefault("magic", 700100)
     cfg.setdefault("max_positions", 1)
     cfg.setdefault("risk_pct", 0.5)
-    cfg.setdefault("sl_atr_mult", 1.4)
-    cfg.setdefault("rr", 1.8)
     cfg.setdefault("lvn_window", 144)
     cfg.setdefault("lvn_bins", 26)
     cfg.setdefault("lvn_count", 4)
     cfg.setdefault("touch_atr", 0.30)
     cfg.setdefault("ema_fast", 20)
     cfg.setdefault("ema_slow", 60)
+    cfg.setdefault("atr_regime_window", 288)
     cfg.setdefault("deviation", 25)
     cfg.setdefault("fixed_lot_fallback", 0.01)
 
@@ -439,15 +488,13 @@ def run_worker(cfg):
         return
 
     threading.Thread(target=_stdin_watch, daemon=True).start()
-    log(
-        f"LVN bot started | symbol={cfg['symbol']} | risk={cfg['risk_pct']}% | "
-        f"SL={cfg['sl_atr_mult']}ATR | RR={cfg['rr']}"
-    )
+    log(f"LVN bot started | symbol={cfg['symbol']} | risk={cfg['risk_pct']}% | auto SL/TP by M5 regime")
 
     last_status_t = 0.0
     last_signal_t = 0
     last_signal = "-"
     signal_reason = "-"
+    profile_text = "Auto SL/TP: warming up"
 
     try:
         while not _stop.is_set():
@@ -461,12 +508,17 @@ def run_worker(cfg):
                     last_signal = sig_side
                 else:
                     last_signal = "WAIT"
+                prof = auto_sl_tp_profile(sig)
+                profile_text = (
+                    f"{prof['regime']} | SL={prof['sl_mult']:.2f}ATR | RR={prof['rr']:.2f} | "
+                    f"atrRank={prof['atr_rank']:.0%} trend={prof['trend_strength']:.2f}"
+                )
 
                 if sig_time > 0 and sig_time != last_signal_t:
                     last_signal_t = sig_time
                     positions = my_positions(cfg)
                     if len(positions) < int(cfg.get("max_positions", 1)) and sig_side in ("BUY", "SELL"):
-                        ok, reason = open_trade(cfg, sig_side, float(sig.get("atr", 0.0)))
+                        ok, reason = open_trade(cfg, sig_side, sig)
                         if not ok:
                             log(f"Skip open {sig_side}: {reason}", "warn")
                     else:
@@ -474,7 +526,7 @@ def run_worker(cfg):
                             log(f"Signal {sig_side} but max_positions reached ({len(positions)})", "info")
 
             if now - last_status_t >= 1.0:
-                push_status(cfg, last_signal, signal_reason)
+                push_status(cfg, last_signal, signal_reason, profile_text=profile_text)
                 last_status_t = now
 
             time.sleep(0.2)
@@ -576,22 +628,29 @@ def save_cfg(cfg):
 
 
 QSS = """
-QWidget { background:#0b1020; color:#e5e7eb; font-family:'Segoe UI'; font-size:12px; }
-QFrame#card { background:#121a2f; border:1px solid #26314d; border-radius:8px; }
-QLabel#title { font-size:18px; font-weight:700; color:#f8fafc; }
-QLabel#muted { color:#9ca3af; }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    background:#0f172a; border:1px solid #334155; border-radius:6px; padding:5px 8px; color:#f1f5f9;
+QWidget { background:#070c18; color:#e6edf7; font-family:'Segoe UI'; font-size:12px; }
+QFrame#hero {
+    background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #111d38, stop:1 #10263d);
+    border:1px solid #2a3f66; border-radius:14px;
 }
+QFrame#panel { background:#0f182d; border:1px solid #263b5f; border-radius:12px; }
+QLabel#title { font-size:20px; font-weight:800; color:#f8fbff; }
+QLabel#sub { color:#8fb3dd; font-size:11px; }
+QLabel#caption { color:#7f93b1; font-size:10px; font-weight:700; letter-spacing:0.6px; }
+QLabel#metric { color:#f2f7ff; font-size:15px; font-weight:700; font-family:'Consolas'; }
+QLineEdit, QDoubleSpinBox {
+    background:#0a1222; border:1px solid #304768; border-radius:8px; padding:6px 10px; color:#f6fbff;
+}
+QLineEdit:focus, QDoubleSpinBox:focus { border:1px solid #67b2ff; }
 QPushButton {
-    background:#1e293b; border:1px solid #334155; border-radius:6px; padding:6px 12px; font-weight:600;
+    border-radius:8px; padding:7px 14px; font-weight:700; border:1px solid #334e77; background:#16243c; color:#dce8fb;
 }
-QPushButton#start { background:#22c55e; border:none; color:#022c22; }
-QPushButton#stop { background:#ef4444; border:none; color:#fff; }
-QPushButton#save { background:#3b82f6; border:none; color:#fff; }
-QPlainTextEdit { background:#0a1222; border:1px solid #24324d; border-radius:8px; }
-QTableWidget { background:#0a1222; border:1px solid #24324d; border-radius:8px; gridline-color:#1f2a44; }
-QHeaderView::section { background:#1f2a44; color:#cbd5e1; border:none; padding:6px; font-weight:700; }
+QPushButton#start { background:#18a567; border:none; color:#031f13; }
+QPushButton#stop { background:#d43b52; border:none; color:#fff; }
+QPushButton#save { background:#2f7ff0; border:none; color:#fff; }
+QPlainTextEdit { background:#081121; border:1px solid #223a5e; border-radius:10px; padding:6px; }
+QTableWidget { background:#081121; border:1px solid #223a5e; border-radius:10px; gridline-color:#1a2f4f; }
+QHeaderView::section { background:#142744; color:#d7e7ff; border:none; padding:7px; font-weight:700; }
 """
 
 
@@ -607,8 +666,6 @@ class LVNWindow(QtWidgets.QMainWindow):
             "symbol": "XAUUSDc",
             "magic": 700100,
             "risk_pct": 0.5,
-            "sl_atr_mult": 1.4,
-            "rr": 1.8,
             "max_positions": 1,
             "lvn_window": 144,
             "lvn_bins": 26,
@@ -616,6 +673,7 @@ class LVNWindow(QtWidgets.QMainWindow):
             "touch_atr": 0.30,
             "ema_fast": 20,
             "ema_slow": 60,
+            "atr_regime_window": 288,
             "deviation": 25,
         }
         self.cfg.update(load_cfg())
@@ -629,16 +687,17 @@ class LVNWindow(QtWidgets.QMainWindow):
         root = QtWidgets.QWidget()
         self.setCentralWidget(root)
         layout = QtWidgets.QVBoxLayout(root)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
 
         header = QtWidgets.QFrame()
-        header.setObjectName("card")
+        header.setObjectName("hero")
         h = QtWidgets.QHBoxLayout(header)
-        title = QtWidgets.QLabel("LVN BOT - TP/SL rõ ràng (MT5)")
+        h.setContentsMargins(16, 14, 16, 14)
+        title = QtWidgets.QLabel("LVN BOT - Auto SL/TP theo M5")
         title.setObjectName("title")
-        subtitle = QtWidgets.QLabel("Khuyến nghị test account 10,000 cent | Symbol mặc định: XAUUSDc")
-        subtitle.setObjectName("muted")
+        subtitle = QtWidgets.QLabel("Giữ đơn giản: chỉ chỉnh Risk %/lệnh. Bot tự tính SL/TP theo biến động thị trường M5.")
+        subtitle.setObjectName("sub")
         left = QtWidgets.QVBoxLayout()
         left.addWidget(title)
         left.addWidget(subtitle)
@@ -656,81 +715,62 @@ class LVNWindow(QtWidgets.QMainWindow):
         layout.addWidget(header)
 
         body = QtWidgets.QHBoxLayout()
-        body.setSpacing(10)
+        body.setSpacing(12)
         layout.addLayout(body, 1)
 
         left_panel = QtWidgets.QFrame()
-        left_panel.setObjectName("card")
+        left_panel.setObjectName("panel")
         left_layout = QtWidgets.QFormLayout(left_panel)
-        left_layout.setContentsMargins(10, 10, 10, 10)
-        left_layout.setSpacing(8)
+        left_layout.setContentsMargins(12, 12, 12, 12)
+        left_layout.setSpacing(10)
 
         self.ed_login = QtWidgets.QLineEdit()
         self.ed_password = QtWidgets.QLineEdit()
         self.ed_password.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.ed_server = QtWidgets.QLineEdit()
         self.ed_path = QtWidgets.QLineEdit()
-        self.ed_symbol = QtWidgets.QLineEdit("XAUUSDc")
-        self.sp_magic = QtWidgets.QSpinBox()
-        self.sp_magic.setRange(1, 2_000_000_000)
+        self.lb_symbol_fixed = QtWidgets.QLabel("XAUUSDc (fixed)")
+        self.lb_symbol_fixed.setObjectName("metric")
+        self.lb_strategy = QtWidgets.QLabel("AUTO: LVN(M5)+EMA filter | Max position = 1")
+        self.lb_strategy.setObjectName("sub")
         self.sp_risk = QtWidgets.QDoubleSpinBox()
         self.sp_risk.setRange(0.01, 10.0)
         self.sp_risk.setSingleStep(0.1)
-        self.sp_sl_atr = QtWidgets.QDoubleSpinBox()
-        self.sp_sl_atr.setRange(0.2, 10.0)
-        self.sp_sl_atr.setSingleStep(0.1)
-        self.sp_rr = QtWidgets.QDoubleSpinBox()
-        self.sp_rr.setRange(0.5, 10.0)
-        self.sp_rr.setSingleStep(0.1)
-        self.sp_max_pos = QtWidgets.QSpinBox()
-        self.sp_max_pos.setRange(1, 10)
-        self.sp_lvn_window = QtWidgets.QSpinBox()
-        self.sp_lvn_window.setRange(50, 500)
-        self.sp_bins = QtWidgets.QSpinBox()
-        self.sp_bins.setRange(10, 80)
-        self.sp_lvn_count = QtWidgets.QSpinBox()
-        self.sp_lvn_count.setRange(1, 12)
-        self.sp_touch = QtWidgets.QDoubleSpinBox()
-        self.sp_touch.setRange(0.05, 2.0)
-        self.sp_touch.setSingleStep(0.05)
-        self.sp_ema_fast = QtWidgets.QSpinBox()
-        self.sp_ema_fast.setRange(3, 100)
-        self.sp_ema_slow = QtWidgets.QSpinBox()
-        self.sp_ema_slow.setRange(10, 300)
+        self.sp_risk.setDecimals(2)
+        self.sp_risk.setSuffix(" %")
+        self.lb_auto_profile = QtWidgets.QLabel("Auto profile: warming up...")
+        self.lb_auto_profile.setObjectName("sub")
 
         left_layout.addRow("MT5 login", self.ed_login)
         left_layout.addRow("MT5 password", self.ed_password)
         left_layout.addRow("MT5 server", self.ed_server)
         left_layout.addRow("Terminal path", self.ed_path)
-        left_layout.addRow("Symbol", self.ed_symbol)
-        left_layout.addRow("Magic", self.sp_magic)
+        left_layout.addRow("Symbol", self.lb_symbol_fixed)
         left_layout.addRow("Risk % / lệnh", self.sp_risk)
-        left_layout.addRow("SL ATR mult", self.sp_sl_atr)
-        left_layout.addRow("R:R (TP)", self.sp_rr)
-        left_layout.addRow("Max positions", self.sp_max_pos)
-        left_layout.addRow("LVN window (M5)", self.sp_lvn_window)
-        left_layout.addRow("LVN bins", self.sp_bins)
-        left_layout.addRow("LVN count", self.sp_lvn_count)
-        left_layout.addRow("Touch ATR", self.sp_touch)
-        left_layout.addRow("EMA fast", self.sp_ema_fast)
-        left_layout.addRow("EMA slow", self.sp_ema_slow)
+        left_layout.addRow("Engine", self.lb_strategy)
+        left_layout.addRow("Auto SL/TP", self.lb_auto_profile)
 
         body.addWidget(left_panel, 0)
 
         right_panel = QtWidgets.QFrame()
-        right_panel.setObjectName("card")
+        right_panel.setObjectName("panel")
         right_layout = QtWidgets.QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(10, 10, 10, 10)
+        right_layout.setContentsMargins(12, 12, 12, 12)
         right_layout.setSpacing(8)
 
+        metric_row = QtWidgets.QHBoxLayout()
+        metric_row.setSpacing(8)
         self.lb_balance = QtWidgets.QLabel("Balance: -")
         self.lb_equity = QtWidgets.QLabel("Equity: -")
         self.lb_float = QtWidgets.QLabel("Floating: -")
         self.lb_positions = QtWidgets.QLabel("Open positions: 0")
+        for w in [self.lb_balance, self.lb_equity, self.lb_float, self.lb_positions]:
+            w.setObjectName("metric")
+            metric_row.addWidget(w, 1)
+        right_layout.addLayout(metric_row)
         self.lb_signal = QtWidgets.QLabel("Last signal: -")
-        for w in [self.lb_balance, self.lb_equity, self.lb_float, self.lb_positions, self.lb_signal]:
-            w.setObjectName("muted")
-            right_layout.addWidget(w)
+        self.lb_signal.setObjectName("sub")
+        right_layout.addWidget(self.lb_signal)
 
         self.tbl = QtWidgets.QTableWidget(0, 6)
         self.tbl.setHorizontalHeaderLabels(["Ticket", "Side", "Lot", "Open", "P/L", "SL/TP"])
@@ -757,18 +797,9 @@ class LVNWindow(QtWidgets.QMainWindow):
             "password": self.ed_password.text().strip(),
             "server": self.ed_server.text().strip(),
             "path": self.ed_path.text().strip(),
-            "symbol": self.ed_symbol.text().strip() or "XAUUSDc",
-            "magic": int(self.sp_magic.value()),
+            "symbol": "XAUUSDc",
+            "magic": int(self.cfg.get("magic", 700100)),
             "risk_pct": float(self.sp_risk.value()),
-            "sl_atr_mult": float(self.sp_sl_atr.value()),
-            "rr": float(self.sp_rr.value()),
-            "max_positions": int(self.sp_max_pos.value()),
-            "lvn_window": int(self.sp_lvn_window.value()),
-            "lvn_bins": int(self.sp_bins.value()),
-            "lvn_count": int(self.sp_lvn_count.value()),
-            "touch_atr": float(self.sp_touch.value()),
-            "ema_fast": int(self.sp_ema_fast.value()),
-            "ema_slow": int(self.sp_ema_slow.value()),
         }
 
     def _apply_cfg_to_ui(self):
@@ -777,21 +808,12 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.ed_password.setText(str(c.get("password", "")))
         self.ed_server.setText(str(c.get("server", "")))
         self.ed_path.setText(str(c.get("path", "")))
-        self.ed_symbol.setText(str(c.get("symbol", "XAUUSDc")))
-        self.sp_magic.setValue(int(c.get("magic", 700100)))
         self.sp_risk.setValue(float(c.get("risk_pct", 0.5)))
-        self.sp_sl_atr.setValue(float(c.get("sl_atr_mult", 1.4)))
-        self.sp_rr.setValue(float(c.get("rr", 1.8)))
-        self.sp_max_pos.setValue(int(c.get("max_positions", 1)))
-        self.sp_lvn_window.setValue(int(c.get("lvn_window", 144)))
-        self.sp_bins.setValue(int(c.get("lvn_bins", 26)))
-        self.sp_lvn_count.setValue(int(c.get("lvn_count", 4)))
-        self.sp_touch.setValue(float(c.get("touch_atr", 0.30)))
-        self.sp_ema_fast.setValue(int(c.get("ema_fast", 20)))
-        self.sp_ema_slow.setValue(int(c.get("ema_slow", 60)))
 
     def _save_cfg(self):
-        self.cfg = self._collect_cfg()
+        merged = dict(self.cfg)
+        merged.update(self._collect_cfg())
+        self.cfg = merged
         save_cfg(self.cfg)
         self._append_log("Config saved", "info")
 
@@ -824,6 +846,7 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.lb_float.setText(f"Floating: {fl:+,.2f} {cur}")
         self.lb_positions.setText(f"Open positions: {int(obj.get('open_positions', 0))}")
         self.lb_signal.setText(f"Last signal: {obj.get('last_signal', '-')} | {obj.get('signal_reason', '-')}")
+        self.lb_auto_profile.setText(f"Auto profile: {obj.get('profile_text', '-')}")
 
         positions = obj.get("positions", []) or []
         self.tbl.setRowCount(len(positions))
