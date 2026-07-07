@@ -489,7 +489,7 @@ def compute_mode2_m1_scalp_signal(cfg):
             return True
         return bool(strats.get(sid, True))
 
-    def add_candidate(sig_side, sid, why, priority):
+    def add_candidate(sig_side, sid, why, priority, buy_h=None, sell_h=None):
         candidates.append(
             {
                 "side": sig_side,
@@ -497,31 +497,33 @@ def compute_mode2_m1_scalp_signal(cfg):
                 "label": MODE2_STRATEGY_LABELS.get(sid, sid),
                 "reason": why,
                 "priority": int(priority),
+                "buy_hint": buy_h if isinstance(buy_h, (int, float)) else None,
+                "sell_hint": sell_h if isinstance(sell_h, (int, float)) else None,
             }
         )
 
     # 1) Trend pullback: trend M5, entry M1 pullback EMA/VWAP.
     if strat_on("trend_pullback"):
         if trend_buy and low <= e9 and close > e9 and close > vwap_now and close > open_:
-            add_candidate("BUY", "trend_pullback", "M5 uptrend + M1 pullback EMA9/VWAP", 100)
+            add_candidate("BUY", "trend_pullback", "M5 uptrend + M1 pullback EMA9/VWAP", 100, buy_h=e9)
         elif trend_sell and high >= e9 and close < e9 and close < vwap_now and close < open_:
-            add_candidate("SELL", "trend_pullback", "M5 downtrend + M1 pullback EMA9/VWAP", 100)
+            add_candidate("SELL", "trend_pullback", "M5 downtrend + M1 pullback EMA9/VWAP", 100, sell_h=e9)
 
     # 2) Breakout: break short range (5-30m).
     if strat_on("breakout") and i >= 40:
         range_hi = float(df["high"].iloc[i - 30:i].max())
         range_lo = float(df["low"].iloc[i - 30:i].min())
         if close > range_hi + 0.05 * a and close > open_ and close > vwap_now:
-            add_candidate("BUY", "breakout", "breakout range 30m high", 88)
+            add_candidate("BUY", "breakout", "breakout range 30m high", 88, buy_h=range_hi)
         elif close < range_lo - 0.05 * a and close < open_ and close < vwap_now:
-            add_candidate("SELL", "breakout", "breakout range 30m low", 88)
+            add_candidate("SELL", "breakout", "breakout range 30m low", 88, sell_h=range_lo)
 
     # 3) Mean reversion: far from VWAP/Bollinger then snap back.
     if strat_on("mean_reversion"):
         if low < bb_dn_now and close > bb_dn_now and close > open_ and close < vwap_now:
-            add_candidate("BUY", "mean_reversion", "revert from lower Bollinger extreme", 72)
+            add_candidate("BUY", "mean_reversion", "revert from lower Bollinger extreme", 72, buy_h=bb_dn_now)
         elif high > bb_up_now and close < bb_up_now and close < open_ and close > vwap_now:
-            add_candidate("SELL", "mean_reversion", "revert from upper Bollinger extreme", 72)
+            add_candidate("SELL", "mean_reversion", "revert from upper Bollinger extreme", 72, sell_h=bb_up_now)
 
     # 4) Reversal price-action around local support/resistance.
     if strat_on("reversal_pa") and i >= 80:
@@ -536,9 +538,9 @@ def compute_mode2_m1_scalp_signal(cfg):
         morning_star = (prev2_close < prev2_open) and (abs(prev_close - prev_open) < 0.35 * a) and (close > open_) and (close > (prev2_open + prev2_close) / 2.0)
         evening_star = (prev2_close > prev2_open) and (abs(prev_close - prev_open) < 0.35 * a) and (close < open_) and (close < (prev2_open + prev2_close) / 2.0)
         if near_support and (bullish_engulf or bullish_pin or morning_star):
-            add_candidate("BUY", "reversal_pa", "bullish reversal PA near support", 68)
+            add_candidate("BUY", "reversal_pa", "bullish reversal PA near support", 68, buy_h=support)
         elif near_resistance and (bearish_engulf or bearish_pin or evening_star):
-            add_candidate("SELL", "reversal_pa", "bearish reversal PA near resistance", 68)
+            add_candidate("SELL", "reversal_pa", "bearish reversal PA near resistance", 68, sell_h=resistance)
 
     # 5) Orderflow/imbalance proxy: liquidity sweep + CHOCH-style shift.
     if strat_on("orderflow_proxy") and i >= 30:
@@ -549,9 +551,9 @@ def compute_mode2_m1_scalp_signal(cfg):
         choch_up = e20 > e50 and close > e20 and prev_close <= float(ema20_m1.iloc[i - 1])
         choch_dn = e20 < e50 and close < e20 and prev_close >= float(ema20_m1.iloc[i - 1])
         if bull_sweep and choch_up:
-            add_candidate("BUY", "orderflow_proxy", "liquidity sweep low + CHOCH up", 80)
+            add_candidate("BUY", "orderflow_proxy", "liquidity sweep low + CHOCH up", 80, buy_h=swing_lo)
         elif bear_sweep and choch_dn:
-            add_candidate("SELL", "orderflow_proxy", "liquidity sweep high + CHOCH down", 80)
+            add_candidate("SELL", "orderflow_proxy", "liquidity sweep high + CHOCH down", 80, sell_h=swing_hi)
 
     # 6) Session-based scalp: only London/NY overlap windows.
     if strat_on("session_scalp"):
@@ -559,9 +561,9 @@ def compute_mode2_m1_scalp_signal(cfg):
         in_session = (7 <= hour_utc <= 11) or (13 <= hour_utc <= 17)
         if in_session:
             if trend_buy and low <= e9 and close > e9 and close > open_:
-                add_candidate("BUY", "session_scalp", "London/NY session pullback buy", 92)
+                add_candidate("BUY", "session_scalp", "London/NY session pullback buy", 92, buy_h=e9)
             elif trend_sell and high >= e9 and close < e9 and close < open_:
-                add_candidate("SELL", "session_scalp", "London/NY session pullback sell", 92)
+                add_candidate("SELL", "session_scalp", "London/NY session pullback sell", 92, sell_h=e9)
 
     touch_band = 0.20 * a
     buy_hint = max(e9, prev_close + 0.01)
@@ -1038,9 +1040,16 @@ def run_worker(cfg):
                         s_reason = str(cand.get("reason", "no-setup")) if cand else "no-setup"
                         srt["last_signal"] = s_side if s_side in ("BUY", "SELL") else "WAIT"
                         srt["signal_reason"] = s_reason
-                        srt["entry_hint"] = hint_text
-                        srt["buy_hint"] = buy_hint if isinstance(buy_hint, (int, float)) else None
-                        srt["sell_hint"] = sell_hint if isinstance(sell_hint, (int, float)) else None
+                        cbuy = cand.get("buy_hint") if cand else None
+                        csell = cand.get("sell_hint") if cand else None
+                        if isinstance(cbuy, (int, float)) or isinstance(csell, (int, float)):
+                            c_buy_txt = f"Giá {cbuy:.2f} - Buy" if isinstance(cbuy, (int, float)) else "Buy: -"
+                            c_sell_txt = f"Giá {csell:.2f} - Sell" if isinstance(csell, (int, float)) else "Sell: -"
+                            srt["entry_hint"] = f"{c_sell_txt} | {c_buy_txt}"
+                        else:
+                            srt["entry_hint"] = "-"
+                        srt["buy_hint"] = cbuy if isinstance(cbuy, (int, float)) else None
+                        srt["sell_hint"] = csell if isinstance(csell, (int, float)) else None
 
                         if s_side in ("BUY", "SELL"):
                             active_signals.append(f"{MODE2_STRATEGY_LABELS.get(sid, sid)}:{s_side}")
