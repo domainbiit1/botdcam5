@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-entry-recovery-v6"
+BOT_BUILD = "2026-07-08-entry-recovery-v7"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -605,6 +605,19 @@ def compute_mode1_lvn_signal(cfg):
     lvn_main = nearest_level(lvn_levels, close)
     if lvn_main is None:
         lvn_main = close
+    # Fallback to short-window LVN when full profile LVN drifts too far.
+    lvn_dist_atr = abs(close - float(lvn_main)) / max(1e-9, a)
+    if lvn_dist_atr > 0.8:
+        short_window = max(48, min(int(cfg.get("lvn_window", 96)), 140))
+        short_hist = df.iloc[max(0, i - short_window): i]
+        short_levels = build_lvn_levels(
+            short_hist,
+            bins=int(cfg.get("mode1_lvn_short_bins", 24)),
+            lvn_count=int(cfg.get("mode1_lvn_short_count", 4)),
+        )
+        short_near = nearest_level(short_levels, close)
+        if isinstance(short_near, (int, float)):
+            lvn_main = float(short_near)
 
     # Session ranges (UTC for VN timezone behavior).
     ts = pd.to_datetime(df["time"], unit="s")
@@ -1234,11 +1247,13 @@ def compute_mode2_m1_scalp_signal(cfg):
     if strat_on("trend_pullback"):
         bull_reject = close > open_ and (min(open_, close) - low) >= 0.35 * rng
         bear_reject = close < open_ and (high - max(open_, close)) >= 0.35 * rng
+        bull_confirm = bull_reject or (close > prev_close and close > float(ema20.iloc[i]) and body >= 0.45 * rng)
+        bear_confirm = bear_reject or (close < prev_close and close < float(ema20.iloc[i]) and body >= 0.45 * rng)
         near_pull_buy = low <= float(ema20.iloc[i]) + 0.15 * a or low <= float(ema50.iloc[i]) + 0.12 * a or abs(close - support) <= 0.35 * a
         near_pull_sell = high >= float(ema20.iloc[i]) - 0.15 * a or high >= float(ema50.iloc[i]) - 0.12 * a or abs(close - resistance) <= 0.35 * a
         fast_buy = trend_buy and close > float(ema20.iloc[i]) and body >= 0.58 * rng and vol_now >= 1.05 * max(1.0, vol_avg) and rsi_now >= 47
         fast_sell = trend_sell and close < float(ema20.iloc[i]) and body >= 0.58 * rng and vol_now >= 1.05 * max(1.0, vol_avg) and rsi_now <= 53
-        if trend_buy and close > float(ema50.iloc[i]) > float(ema200.iloc[i]) and float(ema20.iloc[i]) > float(ema50.iloc[i]) and near_pull_buy and bull_reject and rsi_now >= 45 and rsi_now > rsi_prev:
+        if trend_buy and close > float(ema50.iloc[i]) > float(ema200.iloc[i]) and float(ema20.iloc[i]) > float(ema50.iloc[i]) and near_pull_buy and bull_confirm and rsi_now >= 44 and rsi_now >= rsi_prev - 0.8:
             entry = close
             sl = min(swing_lo - 0.12 * a, float(ema50.iloc[i]) - 0.18 * a)
             tp1 = entry + abs(entry - sl)
@@ -1250,7 +1265,7 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp1 = entry + abs(entry - sl)
             tp2 = min(resistance, entry + 1.5 * abs(entry - sl)) if resistance > entry else entry + 1.5 * abs(entry - sl)
             build_trade("trend_pullback", "BUY", entry, sl, tp1, tp2, "momentum buy continuation từ vùng EMA20", "Hủy nếu nến M5 đóng lại dưới EMA20", 7, 98, 4, 0.7)
-        elif trend_sell and close < float(ema50.iloc[i]) < float(ema200.iloc[i]) and float(ema20.iloc[i]) < float(ema50.iloc[i]) and near_pull_sell and bear_reject and rsi_now <= 55 and rsi_now < rsi_prev:
+        elif trend_sell and close < float(ema50.iloc[i]) < float(ema200.iloc[i]) and float(ema20.iloc[i]) < float(ema50.iloc[i]) and near_pull_sell and bear_confirm and rsi_now <= 56 and rsi_now <= rsi_prev + 0.8:
             entry = close
             sl = max(swing_hi + 0.12 * a, float(ema50.iloc[i]) + 0.18 * a)
             tp1 = entry - abs(entry - sl)
@@ -1268,7 +1283,7 @@ def compute_mode2_m1_scalp_signal(cfg):
                 miss.append("trend M15/H1 chưa rõ")
             if not (near_pull_buy or near_pull_sell):
                 miss.append("chưa pullback về EMA/SR")
-            if not (bull_reject or bear_reject):
+            if not (bull_confirm or bear_confirm):
                 miss.append("chưa có nến xác nhận")
             if 45.0 <= rsi_now <= 55.0:
                 miss.append("RSI trung tính")
@@ -1282,8 +1297,8 @@ def compute_mode2_m1_scalp_signal(cfg):
         r_hi = float(df["high"].iloc[i - range_n:i].max())
         r_lo = float(df["low"].iloc[i - range_n:i].min())
         r_h = max(1e-9, r_hi - r_lo)
-        breakout_body = body >= 0.50 * rng
-        vol_boost = vol_now >= 1.02 * max(1.0, vol_avg)
+        breakout_body = body >= 0.46 * rng
+        vol_boost = vol_now >= 0.98 * max(1.0, vol_avg)
         if trend_buy and r_h >= 1.0 * a and r_h <= 7.5 * a and close > r_hi + 0.03 * a and breakout_body and vol_boost and (res_big - close) > 1.3 * a:
             entry = close
             sl = r_hi - 0.20 * a
@@ -2063,6 +2078,8 @@ def run_worker(cfg):
                         continue
                     mode_label = MODE_LABELS.get(mode, mode)
                     sig_time = int(sig.get("m5_time") or 0)
+                    if sig_time > 0 and sig_time != int(mode_runtime[mode]["last_time"]):
+                        mode_runtime[mode]["last_time"] = sig_time
                     buy_hint = sig.get("buy_price_hint")
                     sell_hint = sig.get("sell_price_hint")
                     buy_txt = f"Giá {buy_hint:.2f} - Buy" if isinstance(buy_hint, (int, float)) else "Buy: chưa hợp lệ"
