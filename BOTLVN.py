@@ -1010,7 +1010,8 @@ def compute_mode2_m1_scalp_signal(cfg):
     rsi_neutral = 45.0 <= rsi_now <= 55.0 and abs(rsi_now - rsi_prev) < 1.5
     atr_low = a < float(np.nanpercentile(atr.iloc[max(0, i - 250):i + 1], 25))
     narrow_sideway = range_w_12 < 1.3 * a
-    spike_prev = (prev_high - prev_low) > 2.8 * a and abs(close - prev_close) > 0.8 * a
+    # Only block post-spike if market stalls after extreme candle.
+    spike_prev = (prev_high - prev_low) > 2.8 * a and abs(close - prev_close) < 0.25 * a
     if narrow_sideway:
         no_trade_reasons.append("Thị trường đang nhiễu")
     if ema_twisted:
@@ -1081,18 +1082,31 @@ def compute_mode2_m1_scalp_signal(cfg):
         r_h = max(1e-9, r_hi - r_lo)
         breakout_body = body >= 0.55 * rng
         vol_boost = vol_now >= 1.1 * max(1.0, vol_avg)
-        if trend_buy and r_h >= 1.2 * a and r_h <= 4.8 * a and close > r_hi + 0.03 * a and breakout_body and vol_boost and (res_big - close) > 1.3 * a:
+        if trend_buy and r_h >= 1.0 * a and r_h <= 7.5 * a and close > r_hi + 0.03 * a and breakout_body and vol_boost and (res_big - close) > 1.3 * a:
             entry = close
             sl = r_hi - 0.20 * a
             tp1 = entry + max(r_h, abs(entry - sl))
             tp2 = min(res_big, entry + 1.8 * abs(entry - sl)) if res_big > entry else entry + 1.8 * abs(entry - sl)
             build_trade("breakout", "BUY", entry, sl, tp1, tp2, "tích lũy 8-15 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 95, 5)
-        elif trend_sell and r_h >= 1.2 * a and r_h <= 4.8 * a and close < r_lo - 0.03 * a and breakout_body and vol_boost and (close - sup_big) > 1.3 * a:
+        elif trend_sell and r_h >= 1.0 * a and r_h <= 7.5 * a and close < r_lo - 0.03 * a and breakout_body and vol_boost and (close - sup_big) > 1.3 * a:
             entry = close
             sl = r_lo + 0.20 * a
             tp1 = entry - max(r_h, abs(entry - sl))
             tp2 = max(sup_big, entry - 1.8 * abs(entry - sl)) if sup_big < entry else entry - 1.8 * abs(entry - sl)
             build_trade("breakout", "SELL", entry, sl, tp1, tp2, "tích lũy 8-15 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 95, 5)
+        # Impulse continuation fallback: allow strong directional break without perfect retest.
+        elif trend_sell and close < r_lo - 0.25 * a and body >= 0.75 * rng and vol_now >= 1.25 * max(1.0, vol_avg) and (close - sup_big) > 1.8 * a:
+            entry = close
+            sl = max(high, r_lo) + 0.22 * a
+            tp1 = entry - abs(entry - sl)
+            tp2 = max(sup_big, entry - 1.7 * abs(entry - sl))
+            build_trade("breakout", "SELL", entry, sl, tp1, tp2, "impulse breakdown continuation (không retest chuẩn)", "Hủy nếu nến M5 đóng lại trên đáy range vừa phá", 7, 94, 4)
+        elif trend_buy and close > r_hi + 0.25 * a and body >= 0.75 * rng and vol_now >= 1.25 * max(1.0, vol_avg) and (res_big - close) > 1.8 * a:
+            entry = close
+            sl = min(low, r_hi) - 0.22 * a
+            tp1 = entry + abs(entry - sl)
+            tp2 = min(res_big, entry + 1.7 * abs(entry - sl))
+            build_trade("breakout", "BUY", entry, sl, tp1, tp2, "impulse breakout continuation (không retest chuẩn)", "Hủy nếu nến M5 đóng lại dưới đỉnh range vừa phá", 7, 94, 4)
         else:
             set_wait_status("breakout", "NO TRADE | breakout chưa rõ hoặc thiếu retest/volume", buy_h=r_hi, sell_h=r_lo)
     else:
