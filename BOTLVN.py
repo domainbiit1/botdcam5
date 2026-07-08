@@ -85,13 +85,13 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-comment-fallback-v4"
+BOT_BUILD = "2026-07-08-mode1-lvn-pro-v5"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
 MODE_LABELS = {
-    MODE_LVN_1: "Mode 1 - LVN Adaptive",
-    MODE_SCALP_M1_2: "Mode 2 - M5 Scalp Multi-Strategy",
+    MODE_LVN_1: "Mode 1 - LVN Profile Pro",
+    MODE_SCALP_M1_2: "Mode 2 - M5 Six-Strategy Selector",
 }
 MODE_MAGIC_OFFSETS = {
     MODE_LVN_1: 11,
@@ -463,151 +463,358 @@ def nearest_level(levels, px):
 
 
 def compute_mode1_lvn_signal(cfg):
-    bars_needed = max(int(cfg.get("lvn_window", 144)) + 80, 300)
-    bars = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M5, 0, bars_needed)
-    if bars is None or len(bars) < bars_needed // 2:
+    bars = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M5, 0, 900)
+    if bars is None or len(bars) < 320:
         return None
-    df = pd.DataFrame(bars)
-    if len(df) < 100:
-        return None
-    # use closed bar only
-    df = df.iloc[:-1].reset_index(drop=True)
-    if len(df) < 100:
+    df = pd.DataFrame(bars).iloc[:-1].reset_index(drop=True)  # closed bars only
+    if len(df) < 320:
         return None
 
     atr = atr_series(df, 14)
-    ema_fast = df["close"].ewm(span=int(cfg.get("ema_fast", 20)), adjust=False).mean()
-    ema_slow = df["close"].ewm(span=int(cfg.get("ema_slow", 60)), adjust=False).mean()
+    ema20 = df["close"].ewm(span=20, adjust=False).mean()
+    ema50 = df["close"].ewm(span=50, adjust=False).mean()
+    ema200 = df["close"].ewm(span=200, adjust=False).mean()
+    rsi = rsi_series(df["close"].astype(float), 14)
+
+    bars_m15 = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M15, 0, 320)
+    bars_h1 = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_H1, 0, 260)
+    if bars_m15 is None or len(bars_m15) < 120 or bars_h1 is None or len(bars_h1) < 100:
+        return None
+    d15 = pd.DataFrame(bars_m15).iloc[:-1].reset_index(drop=True)
+    dh1 = pd.DataFrame(bars_h1).iloc[:-1].reset_index(drop=True)
+    e20_15 = d15["close"].ewm(span=20, adjust=False).mean()
+    e50_15 = d15["close"].ewm(span=50, adjust=False).mean()
+    e200_15 = d15["close"].ewm(span=200, adjust=False).mean()
+    e20_h1 = dh1["close"].ewm(span=20, adjust=False).mean()
+    e50_h1 = dh1["close"].ewm(span=50, adjust=False).mean()
+    e200_h1 = dh1["close"].ewm(span=200, adjust=False).mean()
 
     i = len(df) - 1
     row = df.iloc[i]
     prev = df.iloc[i - 1]
+    prev2 = df.iloc[i - 2]
+    t_now = int(row["time"])
+    close = float(row["close"])
+    open_ = float(row["open"])
+    high = float(row["high"])
+    low = float(row["low"])
+    prev_close = float(prev["close"])
+    prev_open = float(prev["open"])
+    prev_high = float(prev["high"])
+    prev_low = float(prev["low"])
     a = float(atr.iloc[i]) if float(atr.iloc[i]) > 0 else 0.0
     if a <= 0:
         return None
 
-    lookback = max(48, min(int(cfg.get("lvn_window", 96)), 220))
-    hist = df.iloc[max(0, i - lookback): i]
-    levels = build_lvn_levels(hist, int(cfg.get("lvn_bins", 32)), int(cfg.get("lvn_count", 8)))
-    close_now = float(row["close"])
-    lvl = nearest_level(levels, close_now)
-    # If LVN from long window is too far, fall back to a shorter recent profile
-    # so signal levels stay relevant to current market zone.
-    max_lvn_dist_atr = float(cfg.get("mode1_lvn_max_dist_atr", 2.2))
-    if lvl is not None:
-        approx_atr = float(atr.iloc[i]) if float(atr.iloc[i]) > 0 else 0.0
-        if approx_atr > 0 and abs(float(lvl) - close_now) > max_lvn_dist_atr * approx_atr:
-            short_w = max(36, lookback // 2)
-            hist_short = df.iloc[max(0, i - short_w): i]
-            lv_short = build_lvn_levels(
-                hist_short,
-                int(cfg.get("mode1_lvn_short_bins", max(20, int(cfg.get("lvn_bins", 32)) - 6))),
-                int(cfg.get("mode1_lvn_short_count", max(4, int(cfg.get("lvn_count", 8)) // 2))),
-            )
-            lvl_short = nearest_level(lv_short, close_now)
-            if lvl_short is not None:
-                lvl = lvl_short
-    if lvl is None:
-        return None
-
-    # Volatility regime by ATR percentile in a rolling M5 window.
-    atr_lookback = int(cfg.get("atr_regime_window", 288))
-    atr_hist = atr.iloc[max(0, i - atr_lookback): i + 1].dropna().to_numpy(dtype=float)
-    if len(atr_hist) >= 8:
-        atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist))
-    else:
-        atr_rank = 0.5
-
-    touch_mult = max(float(cfg.get("touch_atr", 0.30)), float(cfg.get("mode1_min_touch_atr", 0.42)))
-    if atr_rank >= 0.75:
-        touch_mult = max(touch_mult, 0.50)
-    touch_dist = touch_mult * a
-    close_px = float(row["close"])
-    low_px = float(row["low"])
-    high_px = float(row["high"])
-    touch_close = abs(close_px - lvl)
-    touch_wick = min(abs(low_px - lvl), abs(high_px - lvl))
-    touch_ok = (touch_close <= touch_dist) or (touch_wick <= 0.75 * touch_dist)
-    price_step = 0.01
-    try:
-        info = mt5.symbol_info(cfg["symbol"])
-        if info is not None:
-            price_step = max(0.0001, float(getattr(info, "point", 0.01) or 0.01))
-    except Exception:
-        pass
-    # Entry guide cho user:
-    #   BUY: can close >= LVN va > close truoc
-    #   SELL: can close <= LVN va < close truoc
-    # Dong thoi van nam trong vung touch quanh LVN.
-    buy_raw = max(float(lvl), float(prev["close"]) + price_step)
-    sell_raw = min(float(lvl), float(prev["close"]) - price_step)
-    buy_upper = float(lvl) + touch_dist
-    sell_lower = float(lvl) - touch_dist
-    buy_price_hint = buy_raw if buy_raw <= buy_upper else None
-    sell_price_hint = sell_raw if sell_raw >= sell_lower else None
-    if not touch_ok:
+    vp_lookback = max(120, min(int(cfg.get("mode1_vp_lookback", 220)), 320))
+    hist = df.iloc[max(0, i - vp_lookback): i]
+    vp = build_volume_profile_summary(hist, bins=int(cfg.get("mode1_vp_bins", 40)), value_area=0.70)
+    if not vp:
         return {
             "side": None,
-            "reason": f"far-from-lvn close={row['close']:.2f} lvn={lvl:.2f} dist={touch_close:.2f}>{touch_dist:.2f}",
-            "m5_time": int(row["time"]),
+            "reason": "NO TRADE | Không có LVN rõ",
+            "m5_time": t_now,
             "atr": a,
-            "lvn": lvl,
-            "buy_price_hint": buy_price_hint,
-            "sell_price_hint": sell_price_hint,
-            "atr_rank": atr_rank,
+            "lvn": close,
+            "buy_price_hint": None,
+            "sell_price_hint": None,
+            "atr_rank": 0.5,
+            "trend_strength": 0.0,
         }
 
-    side = None
-    reason = ""
-    trend_strength = abs(float(ema_fast.iloc[i]) - float(ema_slow.iloc[i])) / max(1e-9, a)
-    min_trend_strength = float(cfg.get("mode1_min_trend_strength", 0.18))
-    open_px = float(row["open"])
-    prev_close = float(prev["close"])
-    trend_up = (
-        float(ema_fast.iloc[i]) > float(ema_slow.iloc[i])
-        or (
-            trend_strength >= min_trend_strength
-            and float(ema_fast.iloc[i]) > float(ema_fast.iloc[i - 1])
-            and close_px > float(ema_fast.iloc[i])
-        )
-    )
-    trend_dn = (
-        float(ema_fast.iloc[i]) < float(ema_slow.iloc[i])
-        or (
-            trend_strength >= min_trend_strength
-            and float(ema_fast.iloc[i]) < float(ema_fast.iloc[i - 1])
-            and close_px < float(ema_fast.iloc[i])
-        )
-    )
-    buy_confirm = close_px >= (float(lvl) - 0.08 * a) and (close_px > prev_close or close_px > open_px)
-    sell_confirm = close_px <= (float(lvl) + 0.08 * a) and (close_px < prev_close or close_px < open_px)
+    poc = float(vp["poc"])
+    vah = float(vp["vah"])
+    val = float(vp["val"])
+    hvn_levels = [float(x) for x in (vp.get("hvn") or [])]
+    lvn_levels = [float(x) for x in (vp.get("lvn") or [])]
+    if not lvn_levels:
+        return {
+            "side": None,
+            "reason": "NO TRADE | Không có LVN rõ",
+            "m5_time": t_now,
+            "atr": a,
+            "lvn": close,
+            "buy_price_hint": None,
+            "sell_price_hint": None,
+            "atr_rank": 0.5,
+            "trend_strength": 0.0,
+        }
 
-    if trend_up and buy_confirm:
-        side = "BUY"
-        reason = f"up-trend touch-lvn {lvl:.2f}"
-    elif trend_dn and sell_confirm:
-        side = "SELL"
-        reason = f"down-trend touch-lvn {lvl:.2f}"
-    else:
-        if not (trend_up or trend_dn):
-            reason = f"trend-weak strength={trend_strength:.2f}"
-        elif trend_up and not buy_confirm:
-            reason = "buy-not-confirmed"
-        elif trend_dn and not sell_confirm:
-            reason = "sell-not-confirmed"
-        else:
-            reason = "trend-not-confirmed"
+    lvn_main = nearest_level(lvn_levels, close)
+    if lvn_main is None:
+        lvn_main = close
 
+    # Session ranges (UTC for VN timezone behavior).
+    ts = pd.to_datetime(df["time"], unit="s")
+    day_key = datetime.utcfromtimestamp(t_now).strftime("%Y-%m-%d")
+    day_mask = ts.dt.strftime("%Y-%m-%d") == day_key
+    asia_mask = day_mask & (ts.dt.hour < 7)
+    london_mask = day_mask & (ts.dt.hour >= 7) & (ts.dt.hour < 12)
+    asia_hi = float(df.loc[asia_mask, "high"].max()) if asia_mask.any() else close
+    asia_lo = float(df.loc[asia_mask, "low"].min()) if asia_mask.any() else close
+    london_hi = float(df.loc[london_mask, "high"].max()) if london_mask.any() else close
+    london_lo = float(df.loc[london_mask, "low"].min()) if london_mask.any() else close
+
+    sr_sup = min(float(d15["low"].iloc[-40:].min()), float(dh1["low"].iloc[-20:].min()))
+    sr_res = max(float(d15["high"].iloc[-40:].max()), float(dh1["high"].iloc[-20:].max()))
+    swing_lo = float(df["low"].iloc[i - 16:i].min())
+    swing_hi = float(df["high"].iloc[i - 16:i].max())
+
+    atr_hist = atr.iloc[max(0, i - 288): i + 1].dropna().to_numpy(dtype=float)
+    atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist)) if len(atr_hist) >= 8 else 0.5
+    trend_strength = abs(float(e20_15.iloc[-1]) - float(e50_15.iloc[-1])) / max(1e-9, a)
+    rsi_now = float(rsi.iloc[i])
+    rsi_prev = float(rsi.iloc[i - 1])
+    body = abs(close - open_)
+    rng = max(1e-9, high - low)
+
+    trend_h1_up = float(dh1["close"].iloc[-1]) > float(e50_h1.iloc[-1]) > float(e200_h1.iloc[-1]) and float(e20_h1.iloc[-1]) > float(e50_h1.iloc[-1])
+    trend_h1_dn = float(dh1["close"].iloc[-1]) < float(e50_h1.iloc[-1]) < float(e200_h1.iloc[-1]) and float(e20_h1.iloc[-1]) < float(e50_h1.iloc[-1])
+    trend_m15_up = float(d15["close"].iloc[-1]) > float(e50_15.iloc[-1]) > float(e200_15.iloc[-1]) and float(e20_15.iloc[-1]) > float(e50_15.iloc[-1])
+    trend_m15_dn = float(d15["close"].iloc[-1]) < float(e50_15.iloc[-1]) < float(e200_15.iloc[-1]) and float(e20_15.iloc[-1]) < float(e50_15.iloc[-1])
+    h1_state = "trend tăng" if trend_h1_up else ("trend giảm" if trend_h1_dn else "đi ngang")
+    m15_state = "đồng thuận H1" if (trend_h1_up and trend_m15_up) or (trend_h1_dn and trend_m15_dn) else "ngược/không đồng thuận H1"
+
+    # Mandatory no-trade filters.
+    no_trade = []
+    twist = abs(float(ema20.iloc[i]) - float(ema50.iloc[i])) < 0.08 * a and abs(float(ema50.iloc[i]) - float(ema200.iloc[i])) < 0.12 * a
+    atr_low = a < float(np.nanpercentile(atr.iloc[max(0, i - 250):i + 1], 25))
+    range_hi_12 = float(df["high"].iloc[i - 12:i].max())
+    range_lo_12 = float(df["low"].iloc[i - 12:i].min())
+    narrow = (range_hi_12 - range_lo_12) < 1.3 * a
+    between_range = abs(close - (range_hi_12 + range_lo_12) / 2.0) <= 0.18 * max(1e-9, (range_hi_12 - range_lo_12))
+    near_key = min(
+        abs(close - lvn_main),
+        abs(close - poc),
+        abs(close - vah),
+        abs(close - val),
+        abs(close - sr_sup),
+        abs(close - sr_res),
+    ) <= 0.55 * a
+    if not near_key or between_range:
+        no_trade.append("Giá đang ở giữa range")
+    if abs(float(lvn_main) - float(poc)) < 0.28 * a:
+        no_trade.append("LVN quá gần POC")
+    if twist:
+        no_trade.append("EMA đang xoắn")
+    if atr_low or narrow:
+        no_trade.append("ATR quá thấp")
+    if 45.0 <= rsi_now <= 55.0 and abs(rsi_now - rsi_prev) < 1.5:
+        no_trade.append("RSI trung tính")
+    if (prev_high - prev_low) > 2.8 * a and abs(close - prev_close) > 0.8 * a:
+        no_trade.append("Giá vừa spike mạnh")
+    if in_news_blackout(cfg, t_now):
+        no_trade.append("Gần tin mạnh")
+    tick = mt5.symbol_info_tick(cfg["symbol"])
+    if tick is not None:
+        spread = abs(float(getattr(tick, "ask", 0.0)) - float(getattr(tick, "bid", 0.0)))
+        if spread > 0.2 * a:
+            no_trade.append("Spread quá cao")
+
+    # Session preference (VN): London 14:00-17:00, NY 19:30-23:00.
+    minute_utc = datetime.utcfromtimestamp(t_now).hour * 60 + datetime.utcfromtimestamp(t_now).minute
+    in_london_ny = (7 * 60 <= minute_utc <= 10 * 60) or (12 * 60 + 30 <= minute_utc <= 16 * 60)
+
+    candidates = []
+
+    def hvn_poc_above(px):
+        pool = [x for x in ([poc] + hvn_levels + [vah, sr_res, london_hi, asia_hi]) if isinstance(x, (int, float)) and x > px]
+        return min(pool) if pool else None
+
+    def hvn_poc_below(px):
+        pool = [x for x in ([poc] + hvn_levels + [val, sr_sup, london_lo, asia_lo]) if isinstance(x, (int, float)) and x < px]
+        return max(pool) if pool else None
+
+    def add_candidate(setup_name, sig_side, entry, sl, tp1, tp2, base_reason, cancel_rule, confidence, factors):
+        if not all(isinstance(x, (int, float)) for x in [entry, sl, tp1, tp2]):
+            return
+        stop = abs(entry - sl)
+        if stop <= 0:
+            return
+        if stop < 2.0:
+            sl = entry - 2.0 if sig_side == "BUY" else entry + 2.0
+            stop = abs(entry - sl)
+        if stop > 4.5:
+            return
+        rr = abs(tp2 - entry) / max(1e-9, stop)
+        if rr < 1.5:
+            return
+        if sig_side == "BUY" and tp1 <= entry:
+            return
+        if sig_side == "SELL" and tp1 >= entry:
+            return
+        # 4/6 high win-rate filter.
+        score = int(sum(1 for x in factors if x))
+        if score < 4:
+            return
+        reason_detail = (
+            f"Chiến lược: {setup_name}\n"
+            f"Bối cảnh H1: {h1_state}\n"
+            f"Bối cảnh M15: {m15_state}\n"
+            f"Vùng LVN chính: {lvn_main:.2f}\n"
+            f"Vị trí giá so với POC/VAH/VAL: close={close:.2f} | POC={poc:.2f} | VAH={vah:.2f} | VAL={val:.2f}\n"
+            f"Hướng lệnh: {sig_side}\n"
+            f"Entry: {entry:.2f} | SL: {sl:.2f} | TP1: {tp1:.2f} | TP2: {tp2:.2f}\n"
+            f"RR dự kiến: {rr:.2f}\n"
+            f"Lý do vào lệnh: {base_reason}\n"
+            f"Yếu tố xác nhận: {score}/6\n"
+            f"Điều kiện hủy kèo: {cancel_rule}\n"
+            f"Cách quản lý lệnh: TP1 chốt 50%, dời BE tại 1R, giữ TP2 nếu còn động lượng\n"
+            f"Mức độ tự tin: {int(confidence)}/10"
+        )
+        candidates.append(
+            {
+                "setup": setup_name,
+                "side": sig_side,
+                "entry": float(entry),
+                "sl": float(sl),
+                "tp1": float(tp1),
+                "tp2": float(tp2),
+                "rr": float(rr),
+                "confidence": int(confidence),
+                "cancel_rule": str(cancel_rule),
+                "reason": reason_detail,
+                "score": score,
+            }
+        )
+
+    if not no_trade:
+        # Setup 1: LVN Rejection BUY
+        buy_reject = low <= lvn_main + 0.08 * a and close > lvn_main and ((min(open_, close) - low) >= 0.45 * rng or ((prev_close < prev_open) and (close > open_) and (open_ <= prev_close) and (close >= prev_open)))
+        support_near = min(abs(lvn_main - sr_sup), abs(lvn_main - val), abs(lvn_main - asia_lo), abs(lvn_main - london_lo)) <= 0.45 * a
+        if buy_reject and support_near and rsi_now <= 52 and rsi_now >= 30 and rsi_now >= rsi_prev:
+            entry = close
+            sl = min(low, swing_lo) - 0.30 * a
+            tp1_raw = hvn_poc_above(entry)
+            tp1 = tp1_raw if isinstance(tp1_raw, (int, float)) else entry + abs(entry - sl)
+            tp2 = max(vah, entry + 1.7 * abs(entry - sl))
+            factors = [support_near, low < min(prev_low, float(prev2["low"])), buy_reject, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= 1.5), in_london_ny]
+            add_candidate(
+                "LVN Rejection",
+                "BUY",
+                entry,
+                sl,
+                tp1,
+                tp2,
+                "Giá quét LVN và đóng lại trên LVN với nến xác nhận tăng.",
+                "Hủy nếu nến M5 đóng lại dưới LVN hoặc RSI rơi dưới 40",
+                8,
+                factors,
+            )
+
+        # Setup 2: LVN Rejection SELL
+        sell_reject = high >= lvn_main - 0.08 * a and close < lvn_main and ((high - max(open_, close)) >= 0.45 * rng or ((prev_close > prev_open) and (close < open_) and (open_ >= prev_close) and (close <= prev_open)))
+        resistance_near = min(abs(lvn_main - sr_res), abs(lvn_main - vah), abs(lvn_main - asia_hi), abs(lvn_main - london_hi)) <= 0.45 * a
+        if sell_reject and resistance_near and rsi_now >= 48 and rsi_now <= 70 and rsi_now <= rsi_prev:
+            entry = close
+            sl = max(high, swing_hi) + 0.30 * a
+            tp1_raw = hvn_poc_below(entry)
+            tp1 = tp1_raw if isinstance(tp1_raw, (int, float)) else entry - abs(entry - sl)
+            tp2 = min(val, entry - 1.7 * abs(entry - sl))
+            factors = [resistance_near, high > max(prev_high, float(prev2["high"])), sell_reject, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= 1.5), in_london_ny]
+            add_candidate(
+                "LVN Rejection",
+                "SELL",
+                entry,
+                sl,
+                tp1,
+                tp2,
+                "Giá quét LVN và đóng lại dưới LVN với nến xác nhận giảm.",
+                "Hủy nếu nến M5 đóng lại trên LVN hoặc RSI vượt 60",
+                8,
+                factors,
+            )
+
+        # Setup 3: LVN Breakout Retest BUY
+        prev_rng = max(1e-9, prev_high - prev_low)
+        breakout_up = prev_close > lvn_main + 0.10 * a and abs(prev_close - prev_open) >= 0.58 * prev_rng and float(df["tick_volume"].iloc[i - 1]) >= 1.1 * max(1.0, float(df["tick_volume"].iloc[max(0, i - 40):i - 1].mean()))
+        retest_up = low <= lvn_main + 0.12 * a and close > lvn_main and close > open_
+        if breakout_up and retest_up and not trend_h1_dn:
+            entry = close
+            sl = min(low, swing_lo, lvn_main) - 0.28 * a
+            tp1_raw = hvn_poc_above(entry)
+            tp1 = tp1_raw if isinstance(tp1_raw, (int, float)) else entry + abs(entry - sl)
+            tp2 = max(vah, entry + 1.8 * abs(entry - sl))
+            factors = [abs(lvn_main - sr_sup) <= 0.7 * a, low < prev_low, retest_up, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= 1.5), in_london_ny]
+            add_candidate(
+                "LVN Breakout Retest",
+                "BUY",
+                entry,
+                sl,
+                tp1,
+                tp2,
+                "Breakout qua LVN bằng nến thân lớn, retest giữ LVN và xác nhận tăng.",
+                "Hủy nếu nến M5 đóng lại dưới LVN",
+                8,
+                factors,
+            )
+
+        # Setup 4: LVN Breakout Retest SELL
+        breakout_dn = prev_close < lvn_main - 0.10 * a and abs(prev_close - prev_open) >= 0.58 * prev_rng and float(df["tick_volume"].iloc[i - 1]) >= 1.1 * max(1.0, float(df["tick_volume"].iloc[max(0, i - 40):i - 1].mean()))
+        retest_dn = high >= lvn_main - 0.12 * a and close < lvn_main and close < open_
+        if breakout_dn and retest_dn and not trend_h1_up:
+            entry = close
+            sl = max(high, swing_hi, lvn_main) + 0.28 * a
+            tp1_raw = hvn_poc_below(entry)
+            tp1 = tp1_raw if isinstance(tp1_raw, (int, float)) else entry - abs(entry - sl)
+            tp2 = min(val, entry - 1.8 * abs(entry - sl))
+            factors = [abs(lvn_main - sr_res) <= 0.7 * a, high > prev_high, retest_dn, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= 1.5), in_london_ny]
+            add_candidate(
+                "LVN Breakout Retest",
+                "SELL",
+                entry,
+                sl,
+                tp1,
+                tp2,
+                "Breakdown qua LVN bằng nến thân lớn, retest thất bại và xác nhận giảm.",
+                "Hủy nếu nến M5 đóng lại trên LVN",
+                8,
+                factors,
+            )
+
+    if not candidates:
+        reasons = list(no_trade)
+        if not reasons:
+            reasons = [
+                "Không có LVN rõ",
+                "Không có nến xác nhận",
+                "RR không đủ 1:1.5",
+            ]
+        summary = "NO TRADE\n\nLý do:\n- " + "\n- ".join(reasons[:4])
+        return {
+            "side": None,
+            "reason": summary,
+            "m5_time": t_now,
+            "atr": a,
+            "lvn": float(lvn_main),
+            "buy_price_hint": None,
+            "sell_price_hint": None,
+            "atr_rank": atr_rank,
+            "trend_strength": trend_strength,
+        }
+
+    # Prioritize setup quality by RR then confidence.
+    candidates.sort(key=lambda x: (x["rr"], x["confidence"], x["score"]), reverse=True)
+    best = candidates[0]
     return {
-        "side": side,
-        "reason": reason,
-        "m5_time": int(row["time"]),
+        "side": best["side"],
+        "reason": best["reason"],
+        "m5_time": t_now,
         "atr": a,
-        "lvn": lvl,
-        "buy_price_hint": buy_price_hint,
-        "sell_price_hint": sell_price_hint,
+        "lvn": float(lvn_main),
+        "buy_price_hint": best["entry"] if best["side"] == "BUY" else None,
+        "sell_price_hint": best["entry"] if best["side"] == "SELL" else None,
         "atr_rank": atr_rank,
         "trend_strength": trend_strength,
+        "entry": best["entry"],
+        "sl": best["sl"],
+        "tp1": best["tp1"],
+        "tp2": best["tp2"],
+        "rr": best["rr"],
+        "confidence": best["confidence"],
+        "cancel_rule": best["cancel_rule"],
+        "strategy_id": "lvn_rejection" if best["setup"] == "LVN Rejection" else "lvn_breakout_retest",
+        "tp": best["tp2"],
     }
 
 
@@ -1844,7 +2051,7 @@ class LVNWindow(QtWidgets.QMainWindow):
         h.setSpacing(10)
         title = QtWidgets.QLabel("EAGoldSuper")
         title.setObjectName("title")
-        subtitle = QtWidgets.QLabel("Multi-mode trading engine · Mode 1 (LVN Adaptive) đang bật")
+        subtitle = QtWidgets.QLabel("Multi-mode trading engine · Mode 1 LVN Profile + Mode 2 selector")
         subtitle.setObjectName("sub")
         left = QtWidgets.QVBoxLayout()
         left.setSpacing(2)
@@ -1894,7 +2101,7 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.ed_path = QtWidgets.QLineEdit()
         self.lb_symbol_fixed = QtWidgets.QLabel("XAUUSDc (fixed)")
         self.lb_symbol_fixed.setObjectName("metricWeak")
-        self.lb_strategy = QtWidgets.QLabel("ACTIVE: Mode 1 - LVN Adaptive | Max position = 1")
+        self.lb_strategy = QtWidgets.QLabel("ACTIVE: Mode 1 - LVN Profile Pro | Max position = 1")
         self.lb_strategy.setObjectName("sub")
         self.sp_risk = QtWidgets.QDoubleSpinBox()
         self.sp_risk.setRange(0.01, 10.0)
@@ -2104,9 +2311,9 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.lb_equity.setText(f"{eq:,.2f} {cur}".strip())
         self.lb_float.setText(f"{fl:+,.2f} {cur}".strip())
         self.lb_positions.setText(str(int(obj.get("open_positions", 0))))
-        self.lb_signal.setText(f"Signal realtime theo mode (M5/M15 closed bars) | Active: {obj.get('active_mode', '-')}")
+        self.lb_signal.setText(f"Signal realtime theo mode (M5 entry | M15/H1 confirm | closed bars) | Active: {obj.get('active_mode', '-')}")
         self.lb_auto_profile.setText(f"Auto profile: {obj.get('profile_text', '-')}")
-        self.lb_strategy.setText(f"ACTIVE: {obj.get('active_mode', 'Mode 1 - LVN Adaptive')} | Max position = 1")
+        self.lb_strategy.setText(f"ACTIVE: {obj.get('active_mode', 'Mode 1 - LVN Profile Pro')} | Max position = 1")
         self.lb_runtime_state.setText("ONLINE")
         signal_rows = obj.get("signal_rows", []) or []
         if not signal_rows:
