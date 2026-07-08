@@ -900,6 +900,8 @@ def compute_mode1_lvn_signal(cfg):
                 "Không có nến xác nhận",
                 f"RR không đủ {rr_min:.2f}",
             ]
+        watch_buy = float(lvn_main + 0.06 * a)
+        watch_sell = float(lvn_main - 0.06 * a)
         summary = "NO TRADE\n\nLý do:\n- " + "\n- ".join(reasons[:4])
         return {
             "side": None,
@@ -907,8 +909,8 @@ def compute_mode1_lvn_signal(cfg):
             "m5_time": t_now,
             "atr": a,
             "lvn": float(lvn_main),
-            "buy_price_hint": None,
-            "sell_price_hint": None,
+            "buy_price_hint": watch_buy,
+            "sell_price_hint": watch_sell,
             "atr_rank": atr_rank,
             "trend_strength": trend_strength,
             "strategy_id": "no-trade",
@@ -1057,15 +1059,32 @@ def compute_mode2_m1_scalp_signal(cfg):
     side = None
     reason = "NO TRADE"
 
+    # Always expose "watch levels" so GUI can track potential entry zones
+    # even while state is NO TRADE.
+    watch_levels = {
+        "trend_pullback": {"buy": float(ema20.iloc[i]), "sell": float(ema20.iloc[i])},
+        "breakout": {"buy": float(range_hi_20), "sell": float(range_lo_20)},
+        "mean_reversion": {"buy": float(bb_dn_now), "sell": float(bb_up_now)},
+        "reversal_pa": {"buy": float(min(support, sup_big)), "sell": float(max(resistance, res_big))},
+        "orderflow_proxy": {
+            "buy": float(df["high"].iloc[i - 6:i].max()),
+            "sell": float(df["low"].iloc[i - 6:i].min()),
+        },
+        "session_scalp": {"buy": float(range_lo_20), "sell": float(range_hi_20)},
+    }
+
     def strat_on(sid):
         return bool(strats.get(sid, True)) if isinstance(strats, dict) else True
 
     def set_wait_status(sid, why, buy_h=None, sell_h=None):
+        dflt = watch_levels.get(sid, {})
+        buy_v = buy_h if isinstance(buy_h, (int, float)) else dflt.get("buy")
+        sell_v = sell_h if isinstance(sell_h, (int, float)) else dflt.get("sell")
         strategy_status[sid] = {
             "state": "WAIT",
             "reason": str(why),
-            "buy_hint": buy_h if isinstance(buy_h, (int, float)) else None,
-            "sell_hint": sell_h if isinstance(sell_h, (int, float)) else None,
+            "buy_hint": float(buy_v) if isinstance(buy_v, (int, float)) else None,
+            "sell_hint": float(sell_v) if isinstance(sell_v, (int, float)) else None,
         }
 
     def required_score(sid):
