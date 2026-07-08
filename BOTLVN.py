@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-mode2-all6-v10"
+BOT_BUILD = "2026-07-08-mode2-all6-v11"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -1169,12 +1169,16 @@ def compute_mode2_m1_scalp_signal(cfg):
         if sig_side == "BUY":
             tp1 = max(float(tp1), float(entry) + stop * 0.8)
             tp2 = max(float(tp2), float(entry) + stop * 1.3)
+            if tp2 <= tp1:
+                tp2 = tp1 + 0.15 * stop
             if tp2 <= float(entry):
                 set_wait_status(sid, "NO TRADE | TP không hợp lệ", buy_h=entry)
                 return
         else:
             tp1 = min(float(tp1), float(entry) - stop * 0.8)
             tp2 = min(float(tp2), float(entry) - stop * 1.3)
+            if tp2 >= tp1:
+                tp2 = tp1 - 0.15 * stop
             if tp2 >= float(entry):
                 set_wait_status(sid, "NO TRADE | TP không hợp lệ", sell_h=entry)
                 return
@@ -1662,7 +1666,7 @@ def _deal_reason_text(reason_code):
     return mapping.get(code, f"reason#{code}")
 
 
-def log_recent_closed_deals(cfg, lookback_hours=24):
+def log_recent_closed_deals(cfg, lookback_hours=24, started_ts=None):
     """Emit detailed close diagnostics for win/loss debug."""
     try:
         start = datetime.now() - timedelta(hours=max(1, int(lookback_hours)))
@@ -1685,6 +1689,7 @@ def log_recent_closed_deals(cfg, lookback_hours=24):
             in_by_pos[pos_id] = {
                 "entry": float(getattr(d, "price", 0.0) or 0.0),
                 "side": side,
+                "comment": str(getattr(d, "comment", "") or ""),
             }
 
         now = time.time()
@@ -1694,6 +1699,9 @@ def log_recent_closed_deals(cfg, lookback_hours=24):
             if mode_id is None:
                 continue
             if int(getattr(d, "entry", -1)) != int(mt5.DEAL_ENTRY_OUT):
+                continue
+            d_ts = int(getattr(d, "time", 0) or 0)
+            if isinstance(started_ts, (int, float)) and d_ts > 0 and d_ts < int(started_ts) - 2:
                 continue
             ticket = int(getattr(d, "ticket", 0) or 0)
             if ticket <= 0 or ticket in _closed_deal_log_cache:
@@ -1713,7 +1721,8 @@ def log_recent_closed_deals(cfg, lookback_hours=24):
                 move_txt = "-"
                 entry_txt = "-"
             comment = str(getattr(d, "comment", "") or "")
-            sid = strategy_id_from_comment(comment, mode_id)
+            open_comment = str(in_leg.get("comment", "") or "")
+            sid = strategy_id_from_comment(open_comment or comment, mode_id)
             if mode_id == MODE_SCALP_M1_2:
                 strat_label = MODE2_STRATEGY_LABELS.get(sid or "", sid or "-")
             else:
@@ -1825,7 +1834,21 @@ def open_trade(cfg, side, signal):
             tp_dist = price - tp
             otype = mt5.ORDER_TYPE_SELL
         if stop_dist <= 0 or tp_dist <= 0:
-            return False, "invalid SL/TP orientation"
+            # Price moved after signal; repair SL/TP orientation around current tick.
+            sig_entry = float(signal.get("entry", price) or price)
+            sig_sl = float(s_sl)
+            stop_dist = abs(sig_entry - sig_sl)
+            if stop_dist < min_stop_dist * 1.05:
+                stop_dist = min_stop_dist * 1.05
+            rr_fix = max(1.2, float(signal.get("rr", rr) or rr))
+            if side == "BUY":
+                sl = price - stop_dist
+                tp = price + stop_dist * rr_fix
+                tp_dist = tp - price
+            else:
+                sl = price + stop_dist
+                tp = price - stop_dist * rr_fix
+                tp_dist = price - tp
         if stop_dist < min_stop_dist * 1.05:
             return False, "SL too close for broker stop-level"
         if tp_dist / max(1e-9, stop_dist) < 1.2:
@@ -2115,6 +2138,7 @@ def run_worker(cfg):
     active_mode_label = ", ".join(active_mode_labels)
     last_heartbeat_t = 0.0
     last_deal_diag_t = 0.0
+    worker_started_ts = int(time.time())
     def _fmt_px(v):
         return f"{float(v):.2f}" if isinstance(v, (int, float)) else "-"
 
@@ -2147,7 +2171,7 @@ def run_worker(cfg):
                 )
                 last_heartbeat_t = now
             if now - last_deal_diag_t >= 15.0:
-                log_recent_closed_deals(cfg, lookback_hours=24)
+                log_recent_closed_deals(cfg, lookback_hours=24, started_ts=worker_started_ts)
                 last_deal_diag_t = now
             cycle_signals = {}
             if MODE_LVN_1 in enabled_modes:
