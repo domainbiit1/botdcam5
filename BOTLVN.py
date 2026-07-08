@@ -106,6 +106,20 @@ MODE2_STRATEGY_LABELS = {
     "orderflow_proxy": "Orderflow/CHOCH (proxy)",
     "session_scalp": "Session-based scalp",
 }
+MODE_SHORT = {
+    MODE_LVN_1: "m1",
+    MODE_SCALP_M1_2: "m2",
+}
+MODE_SHORT_INV = {v: k for k, v in MODE_SHORT.items()}
+MODE2_STRATEGY_SHORT = {
+    "trend_pullback": "tp",
+    "breakout": "bo",
+    "mean_reversion": "mr",
+    "reversal_pa": "rp",
+    "orderflow_proxy": "of",
+    "session_scalp": "ss",
+}
+MODE2_STRATEGY_SHORT_INV = {v: k for k, v in MODE2_STRATEGY_SHORT.items()}
 
 _today_mode_cache = {}
 
@@ -232,6 +246,17 @@ def account_positions_all_modes(cfg):
 
 def strategy_id_from_comment(comment, mode_id):
     c = str(comment or "")
+    if c.startswith("EGS:"):
+        parts = c.split(":")
+        if len(parts) >= 2:
+            parsed_mode = MODE_SHORT_INV.get(parts[1], None)
+            if parsed_mode != mode_id:
+                return None
+            if len(parts) >= 3 and mode_id == MODE_SCALP_M1_2:
+                return MODE2_STRATEGY_SHORT_INV.get(parts[2], None)
+            if mode_id == MODE_SCALP_M1_2:
+                return "trend_pullback"
+            return None
     if not c.startswith("EAGoldSuper:"):
         return None
     parts = c.split(":")
@@ -805,7 +830,12 @@ def open_trade(cfg, side, signal):
 
     mode_id = str(signal.get("mode", MODE_LVN_1))
     strategy_id = str(signal.get("strategy_id", "") or "")
-    trade_comment = f"EAGoldSuper:{mode_id}:{strategy_id}" if strategy_id else f"EAGoldSuper:{mode_id}"
+    mode_short = MODE_SHORT.get(mode_id, "m0")
+    strat_short = ""
+    if mode_id == MODE_SCALP_M1_2 and strategy_id:
+        strat_short = MODE2_STRATEGY_SHORT.get(strategy_id, "")
+    trade_comment = f"EGS:{mode_short}:{strat_short}" if strat_short else f"EGS:{mode_short}"
+    trade_comment = trade_comment[:31]
     req_base = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": cfg["symbol"],
