@@ -520,6 +520,7 @@ def compute_mode1_lvn_signal(cfg):
             "sell_price_hint": None,
             "atr_rank": 0.5,
             "trend_strength": 0.0,
+            "strategy_id": "no-trade",
         }
 
     poc = float(vp["poc"])
@@ -538,6 +539,7 @@ def compute_mode1_lvn_signal(cfg):
             "sell_price_hint": None,
             "atr_rank": 0.5,
             "trend_strength": 0.0,
+            "strategy_id": "no-trade",
         }
 
     lvn_main = nearest_level(lvn_levels, close)
@@ -791,6 +793,7 @@ def compute_mode1_lvn_signal(cfg):
             "sell_price_hint": None,
             "atr_rank": atr_rank,
             "trend_strength": trend_strength,
+            "strategy_id": "no-trade",
         }
 
     # Prioritize setup quality by RR then confidence.
@@ -1541,6 +1544,7 @@ def push_status(
                         "mode_label": MODE_LABELS.get(mode, mode),
                         "strategy_label": MODE2_STRATEGY_LABELS.get(sid, sid),
                         "state": str(srt.get("last_signal", "WAIT")),
+                        "decision": "TRADE" if str(srt.get("last_signal", "WAIT")) in ("BUY", "SELL") else "NO TRADE",
                         "reason": str(srt.get("signal_reason", "no-setup")),
                         "buy_hint": srt.get("buy_hint"),
                         "sell_hint": srt.get("sell_hint"),
@@ -1550,8 +1554,9 @@ def push_status(
             signal_rows.append(
                 {
                     "mode_label": MODE_LABELS.get(mode, mode),
-                    "strategy_label": "-",
+                    "strategy_label": str(rt.get("strategy_label", "-")),
                     "state": str(rt.get("last_signal", "-")),
+                    "decision": "TRADE" if str(rt.get("last_signal", "-")) in ("BUY", "SELL") else "NO TRADE",
                     "reason": str(rt.get("signal_reason", "-")),
                     "buy_hint": rt.get("buy_hint"),
                     "sell_hint": rt.get("sell_hint"),
@@ -1636,6 +1641,7 @@ def run_worker(cfg):
             "entry_hint": "-",
             "buy_hint": None,
             "sell_hint": None,
+            "strategy_label": "-",
             "strategies": {},
         }
         if mode == MODE_SCALP_M1_2:
@@ -1679,6 +1685,15 @@ def run_worker(cfg):
                     mode_runtime[mode]["entry_hint"] = hint_text
                     mode_runtime[mode]["buy_hint"] = buy_hint if isinstance(buy_hint, (int, float)) else None
                     mode_runtime[mode]["sell_hint"] = sell_hint if isinstance(sell_hint, (int, float)) else None
+                    sid = str(sig.get("strategy_id", "") or "")
+                    if sid == "lvn_rejection":
+                        mode_runtime[mode]["strategy_label"] = "LVN Rejection"
+                    elif sid == "lvn_breakout_retest":
+                        mode_runtime[mode]["strategy_label"] = "LVN Breakout Retest"
+                    elif str(s_reason).startswith("NO TRADE"):
+                        mode_runtime[mode]["strategy_label"] = "NO TRADE"
+                    else:
+                        mode_runtime[mode]["strategy_label"] = "-"
                     prof = auto_sl_tp_profile(sig)
                     mode_runtime[mode]["profile_text"] = (
                         f"{mode_label} | {prof['regime']} | SL={prof['sl_mult']:.2f}ATR | RR={prof['rr']:.2f} | "
@@ -2183,8 +2198,8 @@ class LVNWindow(QtWidgets.QMainWindow):
         sig_cap.setObjectName("caption")
         self.lb_signal = QtWidgets.QLabel("Đang chờ dữ liệu...")
         self.lb_signal.setObjectName("metricWeak")
-        self.signal_tbl = QtWidgets.QTableWidget(0, 6)
-        self.signal_tbl.setHorizontalHeaderLabels(["Mode", "Strategy", "State", "Sell", "Buy", "Reason"])
+        self.signal_tbl = QtWidgets.QTableWidget(0, 7)
+        self.signal_tbl.setHorizontalHeaderLabels(["Mode", "Strategy", "State", "Decision", "Sell", "Buy", "Reason"])
         self.signal_tbl.verticalHeader().setVisible(False)
         self.signal_tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.signal_tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
@@ -2196,11 +2211,13 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.signal_tbl.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
         self.signal_tbl.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
         self.signal_tbl.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.signal_tbl.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Fixed)
         self.signal_tbl.setColumnWidth(0, 190)
         self.signal_tbl.setColumnWidth(1, 185)
         self.signal_tbl.setColumnWidth(2, 85)
-        self.signal_tbl.setColumnWidth(3, 100)
+        self.signal_tbl.setColumnWidth(3, 95)
         self.signal_tbl.setColumnWidth(4, 100)
+        self.signal_tbl.setColumnWidth(5, 100)
         signal_l.addWidget(sig_cap)
         signal_l.addWidget(self.lb_signal)
         signal_l.addWidget(self.signal_tbl)
@@ -2323,6 +2340,7 @@ class LVNWindow(QtWidgets.QMainWindow):
                         "mode_label": str(m.get("label", m.get("id", "-"))),
                         "strategy_label": "-",
                         "state": str(m.get("last_signal", "-")),
+                        "decision": "TRADE" if str(m.get("last_signal", "-")) in ("BUY", "SELL") else "NO TRADE",
                         "reason": str(m.get("signal_reason", "-")),
                         "buy_hint": m.get("buy_hint"),
                         "sell_hint": m.get("sell_hint"),
@@ -2338,23 +2356,31 @@ class LVNWindow(QtWidgets.QMainWindow):
                 state_color = "#ef4444"
             else:
                 state_color = "#a5b4cf"
+            decision = str(m.get("decision", "NO TRADE"))
+            decision_color = "#22c55e" if decision == "TRADE" else "#94a3b8"
             buy_hint = m.get("buy_hint")
             sell_hint = m.get("sell_hint")
-            buy_txt = f"{float(buy_hint):.2f}" if isinstance(buy_hint, (int, float)) else "-"
-            sell_txt = f"{float(sell_hint):.2f}" if isinstance(sell_hint, (int, float)) else "-"
+            if state in ("BUY", "SELL"):
+                buy_txt = f"{float(buy_hint):.2f}" if isinstance(buy_hint, (int, float)) else "-"
+                sell_txt = f"{float(sell_hint):.2f}" if isinstance(sell_hint, (int, float)) else "-"
+            else:
+                buy_txt = "-"
+                sell_txt = "-"
             reason = str(m.get("reason", "-"))
-            vals = [str(m.get("mode_label", "-")), str(m.get("strategy_label", "-")), state, sell_txt, buy_txt, reason]
+            vals = [str(m.get("mode_label", "-")), str(m.get("strategy_label", "-")), state, decision, sell_txt, buy_txt, reason]
             for c, v in enumerate(vals):
                 it = QtWidgets.QTableWidgetItem(v)
-                if c in (3, 4):
+                if c in (4, 5):
                     it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                elif c == 2:
+                elif c in (2, 3):
                     it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 # Keep table readable in all themes/states.
                 bg = "#0a1324" if (r % 2 == 0) else "#0c1730"
                 it.setBackground(QtGui.QColor(bg))
                 if c == 2:
                     it.setForeground(QtGui.QColor(state_color))
+                elif c == 3:
+                    it.setForeground(QtGui.QColor(decision_color))
                 else:
                     it.setForeground(QtGui.QColor("#dbe8ff"))
                 self.signal_tbl.setItem(r, c, it)
