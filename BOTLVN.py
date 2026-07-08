@@ -387,10 +387,27 @@ def compute_mode1_lvn_signal(cfg):
     if a <= 0:
         return None
 
-    lookback = max(72, min(int(cfg.get("lvn_window", 144)), 220))
+    lookback = max(48, min(int(cfg.get("lvn_window", 96)), 220))
     hist = df.iloc[max(0, i - lookback): i]
-    levels = build_lvn_levels(hist, int(cfg.get("lvn_bins", 26)), int(cfg.get("lvn_count", 4)))
-    lvl = nearest_level(levels, float(row["close"]))
+    levels = build_lvn_levels(hist, int(cfg.get("lvn_bins", 32)), int(cfg.get("lvn_count", 8)))
+    close_now = float(row["close"])
+    lvl = nearest_level(levels, close_now)
+    # If LVN from long window is too far, fall back to a shorter recent profile
+    # so signal levels stay relevant to current market zone.
+    max_lvn_dist_atr = float(cfg.get("mode1_lvn_max_dist_atr", 2.2))
+    if lvl is not None:
+        approx_atr = float(atr.iloc[i]) if float(atr.iloc[i]) > 0 else 0.0
+        if approx_atr > 0 and abs(float(lvl) - close_now) > max_lvn_dist_atr * approx_atr:
+            short_w = max(36, lookback // 2)
+            hist_short = df.iloc[max(0, i - short_w): i]
+            lv_short = build_lvn_levels(
+                hist_short,
+                int(cfg.get("mode1_lvn_short_bins", max(20, int(cfg.get("lvn_bins", 32)) - 6))),
+                int(cfg.get("mode1_lvn_short_count", max(4, int(cfg.get("lvn_count", 8)) // 2))),
+            )
+            lvl_short = nearest_level(lv_short, close_now)
+            if lvl_short is not None:
+                lvl = lvl_short
     if lvl is None:
         return None
 
@@ -1105,9 +1122,12 @@ def run_worker(cfg):
     cfg.setdefault("magic", 700100)
     cfg.setdefault("max_positions", 1)
     cfg.setdefault("risk_pct", 0.5)
-    cfg.setdefault("lvn_window", 144)
-    cfg.setdefault("lvn_bins", 26)
-    cfg.setdefault("lvn_count", 4)
+    cfg.setdefault("lvn_window", 96)
+    cfg.setdefault("lvn_bins", 32)
+    cfg.setdefault("lvn_count", 8)
+    cfg.setdefault("mode1_lvn_max_dist_atr", 2.2)
+    cfg.setdefault("mode1_lvn_short_bins", 24)
+    cfg.setdefault("mode1_lvn_short_count", 4)
     cfg.setdefault("touch_atr", 0.30)
     cfg.setdefault("ema_fast", 20)
     cfg.setdefault("ema_slow", 60)
@@ -1509,9 +1529,12 @@ class LVNWindow(QtWidgets.QMainWindow):
             "modes": {m: {"enabled": (m in DEFAULT_ACTIVE_MODES)} for m in MODE_LABELS},
             "risk_pct": 0.5,
             "max_positions": 1,
-            "lvn_window": 144,
-            "lvn_bins": 26,
-            "lvn_count": 4,
+            "lvn_window": 96,
+            "lvn_bins": 32,
+            "lvn_count": 8,
+            "mode1_lvn_max_dist_atr": 2.2,
+            "mode1_lvn_short_bins": 24,
+            "mode1_lvn_short_count": 4,
             "touch_atr": 0.30,
             "ema_fast": 20,
             "ema_slow": 60,
