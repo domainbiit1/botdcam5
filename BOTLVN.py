@@ -776,6 +776,13 @@ def open_trade(cfg, side, signal):
     sl_atr = max(0.2, float(profile["sl_mult"]))
     rr = max(0.5, float(profile["rr"]))
     stop_dist = sl_atr * atr_now
+    # Broker stop-level guard: avoid invalid SL/TP too close to market.
+    point = float(getattr(info, "point", 0.01) or 0.01)
+    stops_level_pts = float(getattr(info, "trade_stops_level", 0.0) or 0.0)
+    min_stop_dist = max(0.0, stops_level_pts * point)
+    if stop_dist < min_stop_dist * 1.05:
+        stop_dist = min_stop_dist * 1.05
+
     lot = lot_from_risk(cfg, stop_dist)
     if lot <= 0:
         return False, "lot <= 0"
@@ -793,7 +800,7 @@ def open_trade(cfg, side, signal):
     mode_id = str(signal.get("mode", MODE_LVN_1))
     strategy_id = str(signal.get("strategy_id", "") or "")
     trade_comment = f"EAGoldSuper:{mode_id}:{strategy_id}" if strategy_id else f"EAGoldSuper:{mode_id}"
-    req = {
+    req_base = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": cfg["symbol"],
         "volume": lot,
@@ -805,14 +812,28 @@ def open_trade(cfg, side, signal):
         "magic": int(mode_magic(cfg, mode_id)),
         "comment": trade_comment,
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
     }
-    res = mt5.order_send(req)
-    if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
-        req["type_filling"] = mt5.ORDER_FILLING_FOK
+    fill_modes = [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
+    # Keep order but avoid duplicates.
+    uniq_fill_modes = []
+    for fm in fill_modes:
+        if fm not in uniq_fill_modes:
+            uniq_fill_modes.append(fm)
+
+    res = None
+    attempts = []
+    for fm in uniq_fill_modes:
+        req = dict(req_base)
+        req["type_filling"] = fm
         res = mt5.order_send(req)
-    if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
-        return False, f"order_send failed ret={getattr(res, 'retcode', None)}"
+        if res is not None and getattr(res, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+            break
+        attempts.append(
+            f"fill={fm} ret={getattr(res, 'retcode', None)} last_error={mt5.last_error()}"
+        )
+
+    if res is None or getattr(res, "retcode", None) != mt5.TRADE_RETCODE_DONE:
+        return False, "order_send failed | " + " | ".join(attempts[-3:])
 
     send(
         {
