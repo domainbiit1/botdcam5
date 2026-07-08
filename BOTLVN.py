@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-mode1-lvn-pro-v5"
+BOT_BUILD = "2026-07-08-entry-recovery-v6"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -851,9 +851,9 @@ def compute_mode1_lvn_signal(cfg):
             )
 
         # Setup 5: LVN Fast Continuation (nới để không bỏ sóng mạnh)
-        cont_buy = close > lvn_main + 0.10 * a and body >= 0.55 * rng and (float(ema20.iloc[i]) > float(ema50.iloc[i]) or close > float(ema20.iloc[i])) and rsi_now > 50
-        cont_sell = close < lvn_main - 0.10 * a and body >= 0.55 * rng and (float(ema20.iloc[i]) < float(ema50.iloc[i]) or close < float(ema20.iloc[i])) and rsi_now < 50
-        if in_london_ny and cont_buy and body <= 2.6 * a:
+        cont_buy = close > lvn_main + 0.05 * a and body >= 0.40 * rng and (float(ema20.iloc[i]) > float(ema50.iloc[i]) or close > float(ema20.iloc[i])) and rsi_now > 48
+        cont_sell = close < lvn_main - 0.05 * a and body >= 0.40 * rng and (float(ema20.iloc[i]) < float(ema50.iloc[i]) or close < float(ema20.iloc[i])) and rsi_now < 52
+        if cont_buy and body <= 2.8 * a:
             entry = close
             sl = min(low, lvn_main) - 0.20 * a
             stop = abs(entry - sl)
@@ -873,7 +873,7 @@ def compute_mode1_lvn_signal(cfg):
                 factors,
                 min(0.7, lot_factor_default),
             )
-        if in_london_ny and cont_sell and body <= 2.6 * a:
+        if cont_sell and body <= 2.8 * a:
             entry = close
             sl = max(high, lvn_main) + 0.20 * a
             stop = abs(entry - sl)
@@ -897,9 +897,15 @@ def compute_mode1_lvn_signal(cfg):
     if not candidates:
         reasons = list(no_trade)
         if not reasons:
+            dist_atr = abs(close - lvn_main) / max(1e-9, a)
+            near_lvn = dist_atr <= 0.25
             reasons = [
-                f"chưa chạm vùng LVN đủ gần (close={close:.2f}, LVN={lvn_main:.2f}, lệch={abs(close-lvn_main):.2f} ~ {abs(close-lvn_main)/max(1e-9,a):.2f} ATR)",
-                "chưa có nến reject/retest xác nhận tại LVN",
+                (
+                    f"chưa chạm vùng LVN đủ gần (close={close:.2f}, LVN={lvn_main:.2f}, lệch={abs(close-lvn_main):.2f} ~ {dist_atr:.2f} ATR)"
+                    if not near_lvn
+                    else f"đã vào vùng LVN (close={close:.2f}, LVN={lvn_main:.2f}, lệch={abs(close-lvn_main):.2f} ~ {dist_atr:.2f} ATR) nhưng chưa có nến xác nhận"
+                ),
+                "chưa có nến reject/retest/continuation xác nhận tại LVN",
                 f"RR chưa đạt ngưỡng tối thiểu {rr_min:.2f}",
             ]
         watch_buy = float(lvn_main + 0.06 * a)
@@ -1230,8 +1236,8 @@ def compute_mode2_m1_scalp_signal(cfg):
         bear_reject = close < open_ and (high - max(open_, close)) >= 0.35 * rng
         near_pull_buy = low <= float(ema20.iloc[i]) + 0.15 * a or low <= float(ema50.iloc[i]) + 0.12 * a or abs(close - support) <= 0.35 * a
         near_pull_sell = high >= float(ema20.iloc[i]) - 0.15 * a or high >= float(ema50.iloc[i]) - 0.12 * a or abs(close - resistance) <= 0.35 * a
-        fast_buy = trend_buy and close > float(ema20.iloc[i]) and body >= 0.72 * rng and vol_now >= 1.15 * max(1.0, vol_avg) and rsi_now >= 48
-        fast_sell = trend_sell and close < float(ema20.iloc[i]) and body >= 0.72 * rng and vol_now >= 1.15 * max(1.0, vol_avg) and rsi_now <= 52
+        fast_buy = trend_buy and close > float(ema20.iloc[i]) and body >= 0.58 * rng and vol_now >= 1.05 * max(1.0, vol_avg) and rsi_now >= 47
+        fast_sell = trend_sell and close < float(ema20.iloc[i]) and body >= 0.58 * rng and vol_now >= 1.05 * max(1.0, vol_avg) and rsi_now <= 53
         if trend_buy and close > float(ema50.iloc[i]) > float(ema200.iloc[i]) and float(ema20.iloc[i]) > float(ema50.iloc[i]) and near_pull_buy and bull_reject and rsi_now >= 45 and rsi_now > rsi_prev:
             entry = close
             sl = min(swing_lo - 0.12 * a, float(ema50.iloc[i]) - 0.18 * a)
@@ -1276,8 +1282,8 @@ def compute_mode2_m1_scalp_signal(cfg):
         r_hi = float(df["high"].iloc[i - range_n:i].max())
         r_lo = float(df["low"].iloc[i - range_n:i].min())
         r_h = max(1e-9, r_hi - r_lo)
-        breakout_body = body >= 0.55 * rng
-        vol_boost = vol_now >= 1.1 * max(1.0, vol_avg)
+        breakout_body = body >= 0.50 * rng
+        vol_boost = vol_now >= 1.02 * max(1.0, vol_avg)
         if trend_buy and r_h >= 1.0 * a and r_h <= 7.5 * a and close > r_hi + 0.03 * a and breakout_body and vol_boost and (res_big - close) > 1.3 * a:
             entry = close
             sl = r_hi - 0.20 * a
