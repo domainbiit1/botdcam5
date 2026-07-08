@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-mode2-all6-v13"
+BOT_BUILD = "2026-07-08-mode2-all6-v14"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -1285,8 +1285,9 @@ def compute_mode2_m1_scalp_signal(cfg):
         bear_reject = close < open_ and (high - max(open_, close)) >= 0.35 * rng
         bull_confirm = bull_reject or (close > prev_close and close > float(ema20.iloc[i]) and body >= 0.45 * rng)
         bear_confirm = bear_reject or (close < prev_close and close < float(ema20.iloc[i]) and body >= 0.45 * rng)
-        buy_trend_ok = trend_buy and close > float(ema50.iloc[i]) > float(ema200.iloc[i]) and float(ema20.iloc[i]) > float(ema50.iloc[i])
-        sell_trend_ok = trend_sell and close < float(ema50.iloc[i]) < float(ema200.iloc[i]) and float(ema20.iloc[i]) < float(ema50.iloc[i])
+        # v14: softer trend gate for pullback in transition phases.
+        buy_trend_ok = trend_buy_15 or (trend_buy_h1 and close > float(ema20.iloc[i]))
+        sell_trend_ok = trend_sell_15 or (trend_sell_h1 and close < float(ema20.iloc[i]))
         near_pull_buy = low <= float(ema20.iloc[i]) + 0.15 * a or low <= float(ema50.iloc[i]) + 0.12 * a or abs(close - support) <= 0.35 * a
         near_pull_sell = high >= float(ema20.iloc[i]) - 0.15 * a or high >= float(ema50.iloc[i]) - 0.12 * a or abs(close - resistance) <= 0.35 * a
         fast_buy = trend_buy and close > float(ema20.iloc[i]) and body >= 0.58 * rng and vol_now >= 1.05 * max(1.0, vol_avg) and rsi_now >= 47
@@ -1354,7 +1355,8 @@ def compute_mode2_m1_scalp_signal(cfg):
         r_lo = float(df["low"].iloc[i - range_n:i].min())
         r_h = max(1e-9, r_hi - r_lo)
         breakout_body = body >= 0.42 * rng
-        vol_boost = vol_now >= 0.95 * max(1.0, vol_avg)
+        vol_mult = 0.92 if in_london_ny else 0.80
+        vol_boost = vol_now >= vol_mult * max(1.0, vol_avg)
         # Break-and-go continuation branch for strong directional markets with shallow pullback.
         cont_sell = (
             trend_sell
@@ -1442,7 +1444,7 @@ def compute_mode2_m1_scalp_signal(cfg):
             if not breakout_body:
                 miss.append("thân nến breakout yếu")
             if not vol_boost:
-                miss.append("volume chưa tăng")
+                miss.append(f"volume chưa đạt ngưỡng động ({vol_mult:.2f}x)")
             set_wait_status("breakout", why_missing(miss, "NO TRADE | breakout chưa rõ hoặc thiếu retest/volume"), buy_h=r_hi, sell_h=r_lo)
     else:
         set_wait_status("breakout", "disabled")
@@ -1907,7 +1909,16 @@ def open_trade(cfg, side, signal):
         if stop_dist < min_stop_dist * 1.05:
             return False, "SL too close for broker stop-level"
         if tp_dist / max(1e-9, stop_dist) < 1.2:
-            return False, "RR below 1:1.2"
+            # v14: execution-aware RR repair when price drift degrades live RR.
+            rr_min_live = 1.2
+            if side == "BUY":
+                tp = price + stop_dist * rr_min_live
+                tp_dist = tp - price
+            else:
+                tp = price - stop_dist * rr_min_live
+                tp_dist = price - tp
+            if tp_dist / max(1e-9, stop_dist) < rr_min_live:
+                return False, "RR below 1:1.2"
         rr = tp_dist / max(1e-9, stop_dist)
     else:
         stop_dist = sl_atr * atr_now
