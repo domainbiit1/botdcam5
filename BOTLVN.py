@@ -387,15 +387,31 @@ def compute_mode1_lvn_signal(cfg):
     if a <= 0:
         return None
 
-    lookback = int(cfg.get("lvn_window", 144))
+    lookback = max(72, min(int(cfg.get("lvn_window", 144)), 220))
     hist = df.iloc[max(0, i - lookback): i]
     levels = build_lvn_levels(hist, int(cfg.get("lvn_bins", 26)), int(cfg.get("lvn_count", 4)))
     lvl = nearest_level(levels, float(row["close"]))
     if lvl is None:
         return None
 
-    touch_dist = float(cfg.get("touch_atr", 0.30)) * a
-    touch_ok = abs(float(row["close"]) - lvl) <= touch_dist
+    # Volatility regime by ATR percentile in a rolling M5 window.
+    atr_lookback = int(cfg.get("atr_regime_window", 288))
+    atr_hist = atr.iloc[max(0, i - atr_lookback): i + 1].dropna().to_numpy(dtype=float)
+    if len(atr_hist) >= 8:
+        atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist))
+    else:
+        atr_rank = 0.5
+
+    touch_mult = max(float(cfg.get("touch_atr", 0.30)), float(cfg.get("mode1_min_touch_atr", 0.42)))
+    if atr_rank >= 0.75:
+        touch_mult = max(touch_mult, 0.50)
+    touch_dist = touch_mult * a
+    close_px = float(row["close"])
+    low_px = float(row["low"])
+    high_px = float(row["high"])
+    touch_close = abs(close_px - lvl)
+    touch_wick = min(abs(low_px - lvl), abs(high_px - lvl))
+    touch_ok = (touch_close <= touch_dist) or (touch_wick <= 0.75 * touch_dist)
     price_step = 0.01
     try:
         info = mt5.symbol_info(cfg["symbol"])
@@ -416,33 +432,55 @@ def compute_mode1_lvn_signal(cfg):
     if not touch_ok:
         return {
             "side": None,
-            "reason": f"far-from-lvn close={row['close']:.2f} lvn={lvl:.2f}",
+            "reason": f"far-from-lvn close={row['close']:.2f} lvn={lvl:.2f} dist={touch_close:.2f}>{touch_dist:.2f}",
             "m5_time": int(row["time"]),
             "atr": a,
             "lvn": lvl,
             "buy_price_hint": buy_price_hint,
             "sell_price_hint": sell_price_hint,
+            "atr_rank": atr_rank,
         }
 
     side = None
     reason = ""
-    if float(ema_fast.iloc[i]) > float(ema_slow.iloc[i]) and float(row["close"]) >= lvl and float(row["close"]) > float(prev["close"]):
+    trend_strength = abs(float(ema_fast.iloc[i]) - float(ema_slow.iloc[i])) / max(1e-9, a)
+    min_trend_strength = float(cfg.get("mode1_min_trend_strength", 0.18))
+    open_px = float(row["open"])
+    prev_close = float(prev["close"])
+    trend_up = (
+        float(ema_fast.iloc[i]) > float(ema_slow.iloc[i])
+        or (
+            trend_strength >= min_trend_strength
+            and float(ema_fast.iloc[i]) > float(ema_fast.iloc[i - 1])
+            and close_px > float(ema_fast.iloc[i])
+        )
+    )
+    trend_dn = (
+        float(ema_fast.iloc[i]) < float(ema_slow.iloc[i])
+        or (
+            trend_strength >= min_trend_strength
+            and float(ema_fast.iloc[i]) < float(ema_fast.iloc[i - 1])
+            and close_px < float(ema_fast.iloc[i])
+        )
+    )
+    buy_confirm = close_px >= (float(lvl) - 0.08 * a) and (close_px > prev_close or close_px > open_px)
+    sell_confirm = close_px <= (float(lvl) + 0.08 * a) and (close_px < prev_close or close_px < open_px)
+
+    if trend_up and buy_confirm:
         side = "BUY"
         reason = f"up-trend touch-lvn {lvl:.2f}"
-    elif float(ema_fast.iloc[i]) < float(ema_slow.iloc[i]) and float(row["close"]) <= lvl and float(row["close"]) < float(prev["close"]):
+    elif trend_dn and sell_confirm:
         side = "SELL"
         reason = f"down-trend touch-lvn {lvl:.2f}"
     else:
-        reason = "trend-not-confirmed"
-
-    # Volatility regime by ATR percentile in a rolling M5 window.
-    atr_lookback = int(cfg.get("atr_regime_window", 288))
-    atr_hist = atr.iloc[max(0, i - atr_lookback): i + 1].dropna().to_numpy(dtype=float)
-    if len(atr_hist) >= 8:
-        atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist))
-    else:
-        atr_rank = 0.5
-    trend_strength = abs(float(ema_fast.iloc[i]) - float(ema_slow.iloc[i])) / max(1e-9, a)
+        if not (trend_up or trend_dn):
+            reason = f"trend-weak strength={trend_strength:.2f}"
+        elif trend_up and not buy_confirm:
+            reason = "buy-not-confirmed"
+        elif trend_dn and not sell_confirm:
+            reason = "sell-not-confirmed"
+        else:
+            reason = "trend-not-confirmed"
 
     return {
         "side": side,
