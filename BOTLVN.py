@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-entry-recovery-v8"
+BOT_BUILD = "2026-07-08-entry-recovery-v9"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -564,7 +564,7 @@ def compute_mode1_lvn_signal(cfg):
     if a <= 0:
         return None
 
-    vp_lookback = max(120, min(int(cfg.get("mode1_vp_lookback", 220)), 320))
+    vp_lookback = max(24, min(int(cfg.get("mode1_vp_lookback", 36)), 48))
     hist = df.iloc[max(0, i - vp_lookback): i]
     vp = build_volume_profile_summary(hist, bins=int(cfg.get("mode1_vp_bins", 40)), value_area=0.70)
     if not vp:
@@ -607,8 +607,8 @@ def compute_mode1_lvn_signal(cfg):
         lvn_main = close
     # Fallback to short-window LVN when full profile LVN drifts too far.
     lvn_dist_atr = abs(close - float(lvn_main)) / max(1e-9, a)
-    if lvn_dist_atr > 0.8:
-        short_window = max(48, min(int(cfg.get("lvn_window", 96)), 140))
+    if lvn_dist_atr > 0.6:
+        short_window = max(12, min(int(cfg.get("mode1_lvn_short_window", 18)), 24))
         short_hist = df.iloc[max(0, i - short_window): i]
         short_levels = build_lvn_levels(
             short_hist,
@@ -619,7 +619,8 @@ def compute_mode1_lvn_signal(cfg):
         if isinstance(short_near, (int, float)):
             lvn_main = float(short_near)
     lvn_dist_atr = abs(close - float(lvn_main)) / max(1e-9, a)
-    if lvn_dist_atr > 1.2:
+    max_lvn_dist_atr = float(cfg.get("mode1_lvn_max_dist_atr", 0.9))
+    if lvn_dist_atr > max_lvn_dist_atr:
         watch_buy = float(lvn_main + 0.06 * a)
         watch_sell = float(lvn_main - 0.06 * a)
         summary = (
@@ -1920,7 +1921,9 @@ def run_worker(cfg):
     cfg.setdefault("lvn_window", 96)
     cfg.setdefault("lvn_bins", 32)
     cfg.setdefault("lvn_count", 8)
-    cfg.setdefault("mode1_lvn_max_dist_atr", 2.2)
+    cfg.setdefault("mode1_vp_lookback", 36)
+    cfg.setdefault("mode1_lvn_max_dist_atr", 0.9)
+    cfg.setdefault("mode1_lvn_short_window", 18)
     cfg.setdefault("mode1_lvn_short_bins", 24)
     cfg.setdefault("mode1_lvn_short_count", 4)
     cfg.setdefault("touch_atr", 0.30)
@@ -2442,7 +2445,9 @@ class LVNWindow(QtWidgets.QMainWindow):
             "lvn_window": 96,
             "lvn_bins": 32,
             "lvn_count": 8,
-            "mode1_lvn_max_dist_atr": 2.2,
+            "mode1_vp_lookback": 36,
+            "mode1_lvn_max_dist_atr": 0.9,
+            "mode1_lvn_short_window": 18,
             "mode1_lvn_short_bins": 24,
             "mode1_lvn_short_count": 4,
             "touch_atr": 0.30,
