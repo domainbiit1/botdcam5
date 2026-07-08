@@ -85,6 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
+BOT_BUILD = "2026-07-08-ordercheck-v2"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -1004,7 +1005,7 @@ def run_worker(cfg):
     active_mode_labels = [MODE_LABELS.get(m, m) for m in get_active_modes(cfg)]
     log(
         f"EAGoldSuper started | symbol={cfg['symbol']} | risk={cfg['risk_pct']}% | "
-        f"active_modes={', '.join(active_mode_labels)} | auto SL/TP by M5 regime"
+        f"active_modes={', '.join(active_mode_labels)} | auto SL/TP by M5 regime | build={BOT_BUILD}"
     )
 
     last_status_t = 0.0
