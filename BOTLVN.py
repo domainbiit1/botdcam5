@@ -754,7 +754,7 @@ def compute_mode1_lvn_signal(cfg):
 
     if not no_trade:
         # Setup 1: LVN Rejection BUY
-        buy_reject = low <= lvn_main + 0.08 * a and close > lvn_main and ((min(open_, close) - low) >= 0.45 * rng or ((prev_close < prev_open) and (close > open_) and (open_ <= prev_close) and (close >= prev_open)))
+        buy_reject = low <= lvn_main + 0.20 * a and close > lvn_main and ((min(open_, close) - low) >= 0.40 * rng or ((prev_close < prev_open) and (close > open_) and (open_ <= prev_close) and (close >= prev_open)))
         support_near = min(abs(lvn_main - sr_sup), abs(lvn_main - val), abs(lvn_main - asia_lo), abs(lvn_main - london_lo)) <= 0.45 * a
         if buy_reject and support_near and rsi_now <= 52 and rsi_now >= 30 and rsi_now >= rsi_prev:
             entry = close
@@ -778,7 +778,7 @@ def compute_mode1_lvn_signal(cfg):
             )
 
         # Setup 2: LVN Rejection SELL
-        sell_reject = high >= lvn_main - 0.08 * a and close < lvn_main and ((high - max(open_, close)) >= 0.45 * rng or ((prev_close > prev_open) and (close < open_) and (open_ >= prev_close) and (close <= prev_open)))
+        sell_reject = high >= lvn_main - 0.20 * a and close < lvn_main and ((high - max(open_, close)) >= 0.40 * rng or ((prev_close > prev_open) and (close < open_) and (open_ >= prev_close) and (close <= prev_open)))
         resistance_near = min(abs(lvn_main - sr_res), abs(lvn_main - vah), abs(lvn_main - asia_hi), abs(lvn_main - london_hi)) <= 0.45 * a
         if sell_reject and resistance_near and rsi_now >= 48 and rsi_now <= 70 and rsi_now <= rsi_prev:
             entry = close
@@ -804,7 +804,7 @@ def compute_mode1_lvn_signal(cfg):
         # Setup 3: LVN Breakout Retest BUY
         prev_rng = max(1e-9, prev_high - prev_low)
         breakout_up = prev_close > lvn_main + 0.10 * a and abs(prev_close - prev_open) >= 0.58 * prev_rng and float(df["tick_volume"].iloc[i - 1]) >= 1.1 * max(1.0, float(df["tick_volume"].iloc[max(0, i - 40):i - 1].mean()))
-        retest_up = low <= lvn_main + 0.12 * a and close > lvn_main and close > open_
+        retest_up = low <= lvn_main + 0.18 * a and close > lvn_main and close > open_
         if breakout_up and retest_up and not trend_h1_dn:
             entry = close
             sl = min(low, swing_lo, lvn_main) - 0.28 * a
@@ -828,7 +828,7 @@ def compute_mode1_lvn_signal(cfg):
 
         # Setup 4: LVN Breakout Retest SELL
         breakout_dn = prev_close < lvn_main - 0.10 * a and abs(prev_close - prev_open) >= 0.58 * prev_rng and float(df["tick_volume"].iloc[i - 1]) >= 1.1 * max(1.0, float(df["tick_volume"].iloc[max(0, i - 40):i - 1].mean()))
-        retest_dn = high >= lvn_main - 0.12 * a and close < lvn_main and close < open_
+        retest_dn = high >= lvn_main - 0.18 * a and close < lvn_main and close < open_
         if breakout_dn and retest_dn and not trend_h1_up:
             entry = close
             sl = max(high, swing_hi, lvn_main) + 0.28 * a
@@ -898,9 +898,9 @@ def compute_mode1_lvn_signal(cfg):
         reasons = list(no_trade)
         if not reasons:
             reasons = [
-                "Không có LVN rõ",
-                "Không có nến xác nhận",
-                f"RR không đủ {rr_min:.2f}",
+                f"chưa chạm vùng LVN đủ gần (close={close:.2f}, LVN={lvn_main:.2f}, lệch={abs(close-lvn_main):.2f} ~ {abs(close-lvn_main)/max(1e-9,a):.2f} ATR)",
+                "chưa có nến reject/retest xác nhận tại LVN",
+                f"RR chưa đạt ngưỡng tối thiểu {rr_min:.2f}",
             ]
         watch_buy = float(lvn_main + 0.06 * a)
         watch_sell = float(lvn_main - 0.06 * a)
@@ -1091,6 +1091,12 @@ def compute_mode2_m1_scalp_signal(cfg):
             "sell_hint": float(sell_v) if isinstance(sell_v, (int, float)) else None,
         }
 
+    def why_missing(parts, fallback):
+        clean = [str(x) for x in parts if str(x).strip()]
+        if not clean:
+            return str(fallback)
+        return "NO TRADE | thiếu: " + ", ".join(clean[:4])
+
     def required_score(sid):
         base = int(MODE2_MIN_SCORE)
         if in_london_ny and sid in ("trend_pullback", "breakout", "session_scalp"):
@@ -1251,7 +1257,16 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp2 = max(support, entry - 1.5 * abs(entry - sl)) if support < entry else entry - 1.5 * abs(entry - sl)
             build_trade("trend_pullback", "SELL", entry, sl, tp1, tp2, "momentum sell continuation từ vùng EMA20", "Hủy nếu nến M5 đóng lại trên EMA20", 7, 98, 4, 0.7)
         else:
-            set_wait_status("trend_pullback", "NO TRADE | chưa đủ điều kiện Trend Pullback", buy_h=float(ema20.iloc[i]), sell_h=float(ema20.iloc[i]))
+            miss = []
+            if not (trend_buy or trend_sell):
+                miss.append("trend M15/H1 chưa rõ")
+            if not (near_pull_buy or near_pull_sell):
+                miss.append("chưa pullback về EMA/SR")
+            if not (bull_reject or bear_reject):
+                miss.append("chưa có nến xác nhận")
+            if 45.0 <= rsi_now <= 55.0:
+                miss.append("RSI trung tính")
+            set_wait_status("trend_pullback", why_missing(miss, "NO TRADE | chưa đủ điều kiện Trend Pullback"), buy_h=float(ema20.iloc[i]), sell_h=float(ema20.iloc[i]))
     else:
         set_wait_status("trend_pullback", "disabled")
 
@@ -1289,7 +1304,16 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp2 = min(res_big, entry + 1.7 * abs(entry - sl))
             build_trade("breakout", "BUY", entry, sl, tp1, tp2, "impulse breakout continuation (không retest chuẩn)", "Hủy nếu nến M5 đóng lại dưới đỉnh range vừa phá", 7, 60, 4, 0.5)
         else:
-            set_wait_status("breakout", "NO TRADE | breakout chưa rõ hoặc thiếu retest/volume", buy_h=r_hi, sell_h=r_lo)
+            miss = []
+            if r_h < 1.0 * a:
+                miss.append("range quá hẹp")
+            if r_h > 7.5 * a:
+                miss.append("range quá rộng")
+            if not breakout_body:
+                miss.append("thân nến breakout yếu")
+            if not vol_boost:
+                miss.append("volume chưa tăng")
+            set_wait_status("breakout", why_missing(miss, "NO TRADE | breakout chưa rõ hoặc thiếu retest/volume"), buy_h=r_hi, sell_h=r_lo)
     else:
         set_wait_status("breakout", "disabled")
 
@@ -1309,7 +1333,14 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp2 = max(range_lo_20, entry - 1.7 * abs(entry - sl))
             build_trade("mean_reversion", "SELL", entry, sl, tp1, tp2, "sideway + chạm BB trên + RSI quá mua", "Hủy nếu breakout thật sự khỏi range", 7, 70, 5)
         else:
-            set_wait_status("mean_reversion", "NO TRADE | chưa đủ điều kiện Mean Reversion", buy_h=bb_dn_now, sell_h=bb_up_now)
+            miss = []
+            if not sideway_ok:
+                miss.append("thị trường chưa đủ sideway")
+            if not (low <= bb_dn_now or high >= bb_up_now):
+                miss.append("chưa chạm biên Bollinger")
+            if not (rsi_now <= 40 or rsi_now >= 60):
+                miss.append("RSI chưa vào vùng cực trị")
+            set_wait_status("mean_reversion", why_missing(miss, "NO TRADE | chưa đủ điều kiện Mean Reversion"), buy_h=bb_dn_now, sell_h=bb_up_now)
     else:
         set_wait_status("mean_reversion", "disabled")
 
@@ -1336,7 +1367,12 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp2 = max(sup_big, entry - 1.8 * abs(entry - sl)) if sup_big < entry else entry - 1.8 * abs(entry - sl)
             build_trade("reversal_pa", "SELL", entry, sl, tp1, tp2, "chạm kháng cự mạnh + tín hiệu đảo chiều PA", "Hủy nếu nến xác nhận kế tiếp đóng trên đỉnh quét", 8, 110, 5)
         else:
-            set_wait_status("reversal_pa", "NO TRADE | chưa có PA đảo chiều tại vùng mạnh", buy_h=sup_big, sell_h=res_big)
+            miss = []
+            if not (touch_sup or touch_res):
+                miss.append("chưa chạm vùng S/R mạnh")
+            if not (bullish_engulf or bearish_engulf or bullish_pin or bearish_pin or morning_star or evening_star):
+                miss.append("chưa có mẫu nến đảo chiều")
+            set_wait_status("reversal_pa", why_missing(miss, "NO TRADE | chưa có PA đảo chiều tại vùng mạnh"), buy_h=sup_big, sell_h=res_big)
     else:
         set_wait_status("reversal_pa", "disabled")
 
@@ -1361,7 +1397,14 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp2 = max(support, entry - 2.0 * abs(entry - sl)) if support < entry else entry - 2.0 * abs(entry - sl)
             build_trade("orderflow_proxy", "SELL", entry, sl, tp1, tp2, "quét đỉnh + CHOCH giảm + retest vùng phá cấu trúc", "Hủy nếu phá lên trên đỉnh quét", 7, 80, 5)
         else:
-            set_wait_status("orderflow_proxy", "NO TRADE | chưa có CHOCH rõ + retest", buy_h=micro_hi, sell_h=micro_lo)
+            miss = []
+            if not (sweep_low or sweep_high):
+                miss.append("chưa có quét đỉnh/đáy")
+            if not (choch_up or choch_dn):
+                miss.append("chưa có phá cấu trúc CHOCH")
+            if trend_buy and trend_sell:
+                miss.append("trend nhiễu")
+            set_wait_status("orderflow_proxy", why_missing(miss, "NO TRADE | chưa có CHOCH rõ + retest"), buy_h=micro_hi, sell_h=micro_lo)
     else:
         set_wait_status("orderflow_proxy", "disabled")
 
