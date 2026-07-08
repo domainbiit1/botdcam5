@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-mode2-all6-v12"
+BOT_BUILD = "2026-07-08-mode2-all6-v13"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -1355,6 +1355,23 @@ def compute_mode2_m1_scalp_signal(cfg):
         r_h = max(1e-9, r_hi - r_lo)
         breakout_body = body >= 0.42 * rng
         vol_boost = vol_now >= 0.95 * max(1.0, vol_avg)
+        # Break-and-go continuation branch for strong directional markets with shallow pullback.
+        cont_sell = (
+            trend_sell
+            and close < min(prev_low, r_lo) - 0.06 * a
+            and body >= 0.48 * rng
+            and close < float(ema20.iloc[i])
+            and vol_now >= 0.88 * max(1.0, vol_avg)
+            and (close - sup_big) > 0.9 * a
+        )
+        cont_buy = (
+            trend_buy
+            and close > max(prev_high, r_hi) + 0.06 * a
+            and body >= 0.48 * rng
+            and close > float(ema20.iloc[i])
+            and vol_now >= 0.88 * max(1.0, vol_avg)
+            and (res_big - close) > 0.9 * a
+        )
         if trend_buy and r_h >= 1.0 * a and r_h <= 7.5 * a and close > r_hi + 0.03 * a and breakout_body and vol_boost and (res_big - close) > 1.3 * a:
             entry = close
             sl = r_hi - 0.20 * a
@@ -1379,6 +1396,18 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp1 = entry - abs(entry - sl)
             tp2 = max(sup_big, entry - 1.35 * abs(entry - sl)) if sup_big < entry else entry - 1.35 * abs(entry - sl)
             build_trade("breakout", "SELL", entry, sl, tp1, tp2, "breakdown continuation volume thấp (lot giảm)", "Hủy nếu đóng lại trong range cũ", 7, 84, 4, 0.7)
+        elif cont_sell:
+            entry = close
+            sl = max(high, prev_high, float(ema20.iloc[i])) + 0.14 * a
+            tp1 = entry - abs(entry - sl)
+            tp2 = max(sup_big, entry - 1.45 * abs(entry - sl)) if sup_big < entry else entry - 1.45 * abs(entry - sl)
+            build_trade("breakout", "SELL", entry, sl, tp1, tp2, "trend continuation break-and-go (không hồi sâu)", "Hủy nếu nến M5 đóng lại trên EMA20", 7, 86, 4, 0.65)
+        elif cont_buy:
+            entry = close
+            sl = min(low, prev_low, float(ema20.iloc[i])) - 0.14 * a
+            tp1 = entry + abs(entry - sl)
+            tp2 = min(res_big, entry + 1.45 * abs(entry - sl)) if res_big > entry else entry + 1.45 * abs(entry - sl)
+            build_trade("breakout", "BUY", entry, sl, tp1, tp2, "trend continuation break-and-go (không hồi sâu)", "Hủy nếu nến M5 đóng lại dưới EMA20", 7, 86, 4, 0.65)
         elif trend_buy and prev_close > r_hi and close > r_hi and close >= prev_close - 0.15 * a and body >= 0.36 * rng:
             entry = close
             sl = min(low, r_hi) - 0.16 * a
