@@ -1059,11 +1059,18 @@ def compute_mode2_m1_scalp_signal(cfg):
             "sell_hint": sell_h if isinstance(sell_h, (int, float)) else None,
         }
 
+    def required_score(sid):
+        base = int(MODE2_MIN_SCORE)
+        if in_london_ny and sid in ("trend_pullback", "breakout", "session_scalp"):
+            return max(4, base - 1)
+        return base
+
     def build_trade(sid, sig_side, entry, sl, tp1, tp2, why, cancel_rule, confidence, priority, confirm_count, lot_factor=1.0):
-        if int(confirm_count) < int(MODE2_MIN_SCORE):
+        req_score = required_score(sid)
+        if int(confirm_count) < int(req_score):
             set_wait_status(
                 sid,
-                f"NO TRADE | điểm tín hiệu thấp (<{MODE2_MIN_SCORE}/10)",
+                f"NO TRADE | điểm {int(confirm_count)}/10 < ngưỡng {int(req_score)}/10",
                 buy_h=entry if sig_side == "BUY" else None,
                 sell_h=entry if sig_side == "SELL" else None,
             )
@@ -1190,18 +1197,32 @@ def compute_mode2_m1_scalp_signal(cfg):
         bear_reject = close < open_ and (high - max(open_, close)) >= 0.35 * rng
         near_pull_buy = low <= float(ema20.iloc[i]) + 0.15 * a or low <= float(ema50.iloc[i]) + 0.12 * a or abs(close - support) <= 0.35 * a
         near_pull_sell = high >= float(ema20.iloc[i]) - 0.15 * a or high >= float(ema50.iloc[i]) - 0.12 * a or abs(close - resistance) <= 0.35 * a
+        fast_buy = trend_buy and close > float(ema20.iloc[i]) and body >= 0.72 * rng and vol_now >= 1.15 * max(1.0, vol_avg) and rsi_now >= 48
+        fast_sell = trend_sell and close < float(ema20.iloc[i]) and body >= 0.72 * rng and vol_now >= 1.15 * max(1.0, vol_avg) and rsi_now <= 52
         if trend_buy and close > float(ema50.iloc[i]) > float(ema200.iloc[i]) and float(ema20.iloc[i]) > float(ema50.iloc[i]) and near_pull_buy and bull_reject and rsi_now >= 45 and rsi_now > rsi_prev:
             entry = close
             sl = min(swing_lo - 0.12 * a, float(ema50.iloc[i]) - 0.18 * a)
             tp1 = entry + abs(entry - sl)
             tp2 = min(resistance, entry + 1.9 * abs(entry - sl)) if resistance > entry else entry + 1.9 * abs(entry - sl)
             build_trade("trend_pullback", "BUY", entry, sl, tp1, tp2, "H1/M15 trend rõ + pullback EMA20/50 + nến xác nhận", "Hủy nếu nến M5 đóng dưới đáy pullback", 8, 100, 5)
+        elif in_london_ny and fast_buy:
+            entry = close
+            sl = min(swing_lo - 0.10 * a, float(ema20.iloc[i]) - 0.15 * a)
+            tp1 = entry + abs(entry - sl)
+            tp2 = min(resistance, entry + 1.5 * abs(entry - sl)) if resistance > entry else entry + 1.5 * abs(entry - sl)
+            build_trade("trend_pullback", "BUY", entry, sl, tp1, tp2, "momentum buy continuation từ vùng EMA20", "Hủy nếu nến M5 đóng lại dưới EMA20", 7, 98, 4, 0.7)
         elif trend_sell and close < float(ema50.iloc[i]) < float(ema200.iloc[i]) and float(ema20.iloc[i]) < float(ema50.iloc[i]) and near_pull_sell and bear_reject and rsi_now <= 55 and rsi_now < rsi_prev:
             entry = close
             sl = max(swing_hi + 0.12 * a, float(ema50.iloc[i]) + 0.18 * a)
             tp1 = entry - abs(entry - sl)
             tp2 = max(support, entry - 1.9 * abs(entry - sl)) if support < entry else entry - 1.9 * abs(entry - sl)
             build_trade("trend_pullback", "SELL", entry, sl, tp1, tp2, "H1/M15 trend rõ + pullback EMA20/50 + nến xác nhận", "Hủy nếu nến M5 đóng trên đỉnh pullback", 8, 100, 5)
+        elif in_london_ny and fast_sell:
+            entry = close
+            sl = max(swing_hi + 0.10 * a, float(ema20.iloc[i]) + 0.15 * a)
+            tp1 = entry - abs(entry - sl)
+            tp2 = max(support, entry - 1.5 * abs(entry - sl)) if support < entry else entry - 1.5 * abs(entry - sl)
+            build_trade("trend_pullback", "SELL", entry, sl, tp1, tp2, "momentum sell continuation từ vùng EMA20", "Hủy nếu nến M5 đóng lại trên EMA20", 7, 98, 4, 0.7)
         else:
             set_wait_status("trend_pullback", "NO TRADE | chưa đủ điều kiện Trend Pullback", buy_h=float(ema20.iloc[i]), sell_h=float(ema20.iloc[i]))
     else:
@@ -1233,13 +1254,13 @@ def compute_mode2_m1_scalp_signal(cfg):
             sl = max(high, r_lo) + 0.22 * a
             tp1 = entry - abs(entry - sl)
             tp2 = max(sup_big, entry - 1.7 * abs(entry - sl))
-            build_trade("breakout", "SELL", entry, sl, tp1, tp2, "impulse breakdown continuation (không retest chuẩn)", "Hủy nếu nến M5 đóng lại trên đáy range vừa phá", 7, 60, 5, 0.5)
+            build_trade("breakout", "SELL", entry, sl, tp1, tp2, "impulse breakdown continuation (không retest chuẩn)", "Hủy nếu nến M5 đóng lại trên đáy range vừa phá", 7, 60, 4, 0.5)
         elif trend_buy and close > r_hi + 0.25 * a and body >= 0.75 * rng and vol_now >= 1.25 * max(1.0, vol_avg) and (res_big - close) > 1.8 * a:
             entry = close
             sl = min(low, r_hi) - 0.22 * a
             tp1 = entry + abs(entry - sl)
             tp2 = min(res_big, entry + 1.7 * abs(entry - sl))
-            build_trade("breakout", "BUY", entry, sl, tp1, tp2, "impulse breakout continuation (không retest chuẩn)", "Hủy nếu nến M5 đóng lại dưới đỉnh range vừa phá", 7, 60, 5, 0.5)
+            build_trade("breakout", "BUY", entry, sl, tp1, tp2, "impulse breakout continuation (không retest chuẩn)", "Hủy nếu nến M5 đóng lại dưới đỉnh range vừa phá", 7, 60, 4, 0.5)
         else:
             set_wait_status("breakout", "NO TRADE | breakout chưa rõ hoặc thiếu retest/volume", buy_h=r_hi, sell_h=r_lo)
     else:
