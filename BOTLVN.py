@@ -503,34 +503,39 @@ def compute_mode2_m1_scalp_signal(cfg):
         )
 
     # 1) Trend pullback: trend M5, entry M1 pullback EMA/VWAP.
+    near_ema9 = abs(close - e9) <= 0.35 * a
+    near_vwap = abs(close - vwap_now) <= 0.45 * a
     if strat_on("trend_pullback"):
-        if trend_buy and low <= e9 and close > e9 and close > vwap_now and close > open_:
+        if trend_buy and (low <= e9 or near_ema9) and close > e9 and (close >= vwap_now or near_vwap):
             add_candidate("BUY", "trend_pullback", "M5 uptrend + M1 pullback EMA9/VWAP", 100, buy_h=e9)
-        elif trend_sell and high >= e9 and close < e9 and close < vwap_now and close < open_:
+        elif trend_sell and (high >= e9 or near_ema9) and close < e9 and (close <= vwap_now or near_vwap):
             add_candidate("SELL", "trend_pullback", "M5 downtrend + M1 pullback EMA9/VWAP", 100, sell_h=e9)
 
     # 2) Breakout: break short range (5-30m).
     if strat_on("breakout") and i >= 40:
-        range_hi = float(df["high"].iloc[i - 30:i].max())
-        range_lo = float(df["low"].iloc[i - 30:i].min())
-        if close > range_hi + 0.05 * a and close > open_ and close > vwap_now:
-            add_candidate("BUY", "breakout", "breakout range 30m high", 88, buy_h=range_hi)
-        elif close < range_lo - 0.05 * a and close < open_ and close < vwap_now:
-            add_candidate("SELL", "breakout", "breakout range 30m low", 88, sell_h=range_lo)
+        range_hi = float(df["high"].iloc[i - 20:i].max())
+        range_lo = float(df["low"].iloc[i - 20:i].min())
+        vol_now = float(df["tick_volume"].iloc[i])
+        vol_avg = float(df["tick_volume"].iloc[max(0, i - 50):i].mean())
+        volume_ok = vol_now >= 0.85 * max(1.0, vol_avg)
+        if close > range_hi and close >= vwap_now - 0.15 * a and volume_ok:
+            add_candidate("BUY", "breakout", "breakout range high", 88, buy_h=range_hi)
+        elif close < range_lo and close <= vwap_now + 0.15 * a and volume_ok:
+            add_candidate("SELL", "breakout", "breakout range low", 88, sell_h=range_lo)
 
     # 3) Mean reversion: far from VWAP/Bollinger then snap back.
     if strat_on("mean_reversion"):
-        if low < bb_dn_now and close > bb_dn_now and close > open_ and close < vwap_now:
+        if low < bb_dn_now and close > bb_dn_now and close < vwap_now + 0.25 * a:
             add_candidate("BUY", "mean_reversion", "revert from lower Bollinger extreme", 72, buy_h=bb_dn_now)
-        elif high > bb_up_now and close < bb_up_now and close < open_ and close > vwap_now:
+        elif high > bb_up_now and close < bb_up_now and close > vwap_now - 0.25 * a:
             add_candidate("SELL", "mean_reversion", "revert from upper Bollinger extreme", 72, sell_h=bb_up_now)
 
     # 4) Reversal price-action around local support/resistance.
     if strat_on("reversal_pa") and i >= 80:
         support = float(df["low"].iloc[i - 80:i].min())
         resistance = float(df["high"].iloc[i - 80:i].max())
-        near_support = abs(close - support) <= 0.30 * a
-        near_resistance = abs(close - resistance) <= 0.30 * a
+        near_support = abs(close - support) <= 0.45 * a
+        near_resistance = abs(close - resistance) <= 0.45 * a
         bullish_engulf = (prev_close < prev_open) and (close > open_) and (open_ <= prev_close) and (close >= prev_open)
         bearish_engulf = (prev_close > prev_open) and (close < open_) and (open_ >= prev_close) and (close <= prev_open)
         bullish_pin = (close > open_) and ((open_ - low) > 1.5 * max(1e-9, (high - close)))
@@ -546,8 +551,8 @@ def compute_mode2_m1_scalp_signal(cfg):
     if strat_on("orderflow_proxy") and i >= 30:
         swing_hi = float(df["high"].iloc[i - 20:i - 1].max())
         swing_lo = float(df["low"].iloc[i - 20:i - 1].min())
-        bull_sweep = low < swing_lo and close > swing_lo + 0.15 * a
-        bear_sweep = high > swing_hi and close < swing_hi - 0.15 * a
+        bull_sweep = low < swing_lo and close > swing_lo + 0.08 * a
+        bear_sweep = high > swing_hi and close < swing_hi - 0.08 * a
         choch_up = e20 > e50 and close > e20 and prev_close <= float(ema20_m1.iloc[i - 1])
         choch_dn = e20 < e50 and close < e20 and prev_close >= float(ema20_m1.iloc[i - 1])
         if bull_sweep and choch_up:
@@ -1088,6 +1093,9 @@ def run_worker(cfg):
                     else:
                         mode_runtime[mode]["last_signal"] = "WAIT"
                         mode_runtime[mode]["signal_reason"] = str(sig.get("reason", "no-setup"))
+                        mode_runtime[mode]["entry_hint"] = "Sell: - | Buy: -"
+                        mode_runtime[mode]["buy_hint"] = None
+                        mode_runtime[mode]["sell_hint"] = None
 
             # Always expose signal state per enabled mode (even WAIT), so GUI
             # never looks blank while waiting for setups.
