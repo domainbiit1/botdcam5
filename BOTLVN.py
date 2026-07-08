@@ -480,6 +480,7 @@ def compute_mode2_m1_scalp_signal(cfg):
     side = None
     reason = "no-setup"
     candidates = []
+    strategy_status = {}
 
     mode2_cfg = cfg.get("modes", {}).get(MODE_SCALP_M1_2, {})
     strats = mode2_cfg.get("strategies", {}) if isinstance(mode2_cfg, dict) else {}
@@ -488,6 +489,14 @@ def compute_mode2_m1_scalp_signal(cfg):
         if not isinstance(strats, dict):
             return True
         return bool(strats.get(sid, True))
+
+    def set_wait_status(sid, why, buy_h=None, sell_h=None):
+        strategy_status[sid] = {
+            "state": "WAIT",
+            "reason": str(why),
+            "buy_hint": buy_h if isinstance(buy_h, (int, float)) else None,
+            "sell_hint": sell_h if isinstance(sell_h, (int, float)) else None,
+        }
 
     def add_candidate(sig_side, sid, why, priority, buy_h=None, sell_h=None):
         candidates.append(
@@ -501,6 +510,12 @@ def compute_mode2_m1_scalp_signal(cfg):
                 "sell_hint": sell_h if isinstance(sell_h, (int, float)) else None,
             }
         )
+        strategy_status[sid] = {
+            "state": str(sig_side),
+            "reason": str(why),
+            "buy_hint": buy_h if isinstance(buy_h, (int, float)) else None,
+            "sell_hint": sell_h if isinstance(sell_h, (int, float)) else None,
+        }
 
     # 1) Trend pullback: trend M5, entry M1 pullback EMA/VWAP.
     near_ema9 = abs(close - e9) <= 0.35 * a
@@ -510,6 +525,10 @@ def compute_mode2_m1_scalp_signal(cfg):
             add_candidate("BUY", "trend_pullback", "M5 uptrend + M1 pullback EMA9/VWAP", 100, buy_h=e9)
         elif trend_sell and (high >= e9 or near_ema9) and close < e9 and (close <= vwap_now or near_vwap):
             add_candidate("SELL", "trend_pullback", "M5 downtrend + M1 pullback EMA9/VWAP", 100, sell_h=e9)
+        else:
+            set_wait_status("trend_pullback", "wait pullback EMA9/VWAP theo trend M5", buy_h=e9, sell_h=e9)
+    else:
+        set_wait_status("trend_pullback", "disabled")
 
     # 2) Breakout: break short range (5-30m).
     if strat_on("breakout") and i >= 40:
@@ -522,6 +541,15 @@ def compute_mode2_m1_scalp_signal(cfg):
             add_candidate("BUY", "breakout", "breakout range high", 88, buy_h=range_hi)
         elif close < range_lo and close <= vwap_now + 0.15 * a and volume_ok:
             add_candidate("SELL", "breakout", "breakout range low", 88, sell_h=range_lo)
+        else:
+            wait_note = "wait break 20-bar range"
+            if not volume_ok:
+                wait_note = "breakout pending: volume yếu"
+            set_wait_status("breakout", wait_note, buy_h=range_hi, sell_h=range_lo)
+    elif strat_on("breakout"):
+        set_wait_status("breakout", "warming up đủ dữ liệu breakout")
+    else:
+        set_wait_status("breakout", "disabled")
 
     # 3) Mean reversion: far from VWAP/Bollinger then snap back.
     if strat_on("mean_reversion"):
@@ -529,6 +557,10 @@ def compute_mode2_m1_scalp_signal(cfg):
             add_candidate("BUY", "mean_reversion", "revert from lower Bollinger extreme", 72, buy_h=bb_dn_now)
         elif high > bb_up_now and close < bb_up_now and close > vwap_now - 0.25 * a:
             add_candidate("SELL", "mean_reversion", "revert from upper Bollinger extreme", 72, sell_h=bb_up_now)
+        else:
+            set_wait_status("mean_reversion", "wait lệch Bollinger rồi hồi", buy_h=bb_dn_now, sell_h=bb_up_now)
+    else:
+        set_wait_status("mean_reversion", "disabled")
 
     # 4) Reversal price-action around local support/resistance.
     if strat_on("reversal_pa") and i >= 80:
@@ -546,6 +578,12 @@ def compute_mode2_m1_scalp_signal(cfg):
             add_candidate("BUY", "reversal_pa", "bullish reversal PA near support", 68, buy_h=support)
         elif near_resistance and (bearish_engulf or bearish_pin or evening_star):
             add_candidate("SELL", "reversal_pa", "bearish reversal PA near resistance", 68, sell_h=resistance)
+        else:
+            set_wait_status("reversal_pa", "wait nến đảo chiều tại S/R", buy_h=support, sell_h=resistance)
+    elif strat_on("reversal_pa"):
+        set_wait_status("reversal_pa", "warming up đủ dữ liệu reversal")
+    else:
+        set_wait_status("reversal_pa", "disabled")
 
     # 5) Orderflow/imbalance proxy: liquidity sweep + CHOCH-style shift.
     if strat_on("orderflow_proxy") and i >= 30:
@@ -559,6 +597,12 @@ def compute_mode2_m1_scalp_signal(cfg):
             add_candidate("BUY", "orderflow_proxy", "liquidity sweep low + CHOCH up", 80, buy_h=swing_lo)
         elif bear_sweep and choch_dn:
             add_candidate("SELL", "orderflow_proxy", "liquidity sweep high + CHOCH down", 80, sell_h=swing_hi)
+        else:
+            set_wait_status("orderflow_proxy", "wait sweep + CHOCH proxy", buy_h=swing_lo, sell_h=swing_hi)
+    elif strat_on("orderflow_proxy"):
+        set_wait_status("orderflow_proxy", "warming up đủ dữ liệu orderflow proxy")
+    else:
+        set_wait_status("orderflow_proxy", "disabled")
 
     # 6) Session-based scalp: only London/NY overlap windows.
     if strat_on("session_scalp"):
@@ -569,6 +613,12 @@ def compute_mode2_m1_scalp_signal(cfg):
                 add_candidate("BUY", "session_scalp", "London/NY session pullback buy", 92, buy_h=e9)
             elif trend_sell and high >= e9 and close < e9 and close < open_:
                 add_candidate("SELL", "session_scalp", "London/NY session pullback sell", 92, sell_h=e9)
+            else:
+                set_wait_status("session_scalp", "in session: wait pullback confirm", buy_h=e9, sell_h=e9)
+        else:
+            set_wait_status("session_scalp", "ngoài giờ London/NY", buy_h=e9, sell_h=e9)
+    else:
+        set_wait_status("session_scalp", "disabled")
 
     touch_band = 0.20 * a
     buy_hint = max(e9, prev_close + 0.01)
@@ -599,6 +649,7 @@ def compute_mode2_m1_scalp_signal(cfg):
         "atr_rank": atr_rank,
         "trend_strength": trend_strength,
         "candidates": ranked,
+        "strategy_status": strategy_status,
     }
 
 
@@ -1026,6 +1077,7 @@ def run_worker(cfg):
                         sid = str(c.get("sid", ""))
                         if sid:
                             candidate_map[sid] = c
+                    status_map = sig.get("strategy_status", {}) if isinstance(sig.get("strategy_status", {}), dict) else {}
 
                     active_signals = []
                     for sid in enabled_strats:
@@ -1041,12 +1093,13 @@ def run_worker(cfg):
                             },
                         )
                         cand = candidate_map.get(sid)
-                        s_side = str(cand.get("side")) if cand else "WAIT"
-                        s_reason = str(cand.get("reason", "no-setup")) if cand else "no-setup"
+                        stat = status_map.get(sid, {}) if isinstance(status_map, dict) else {}
+                        s_side = str(cand.get("side")) if cand else str(stat.get("state", "WAIT"))
+                        s_reason = str(cand.get("reason")) if cand else str(stat.get("reason", "no-setup"))
                         srt["last_signal"] = s_side if s_side in ("BUY", "SELL") else "WAIT"
                         srt["signal_reason"] = s_reason
-                        cbuy = cand.get("buy_hint") if cand else None
-                        csell = cand.get("sell_hint") if cand else None
+                        cbuy = cand.get("buy_hint") if cand else stat.get("buy_hint")
+                        csell = cand.get("sell_hint") if cand else stat.get("sell_hint")
                         if isinstance(cbuy, (int, float)) or isinstance(csell, (int, float)):
                             c_buy_txt = f"Giá {cbuy:.2f} - Buy" if isinstance(cbuy, (int, float)) else "Buy: -"
                             c_sell_txt = f"Giá {csell:.2f} - Sell" if isinstance(csell, (int, float)) else "Sell: -"
