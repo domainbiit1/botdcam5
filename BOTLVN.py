@@ -292,6 +292,17 @@ def count_strategy_positions(cfg, mode_id, strategy_id):
     return out
 
 
+def mode_open_sides(cfg, mode_id):
+    out = set()
+    for p in my_positions(cfg, mode_id):
+        ptype = int(getattr(p, "type", -1))
+        if ptype == int(mt5.POSITION_TYPE_BUY):
+            out.add("BUY")
+        elif ptype == int(mt5.POSITION_TYPE_SELL):
+            out.add("SELL")
+    return out
+
+
 def normalize_mode_settings(cfg):
     modes = cfg.get("modes", {})
     if not isinstance(modes, dict):
@@ -1159,6 +1170,7 @@ def run_worker(cfg):
                     enabled_strats = [sid for sid in MODE2_STRATEGY_LABELS if bool(strat_cfg.get(sid, True))]
                     if not enabled_strats:
                         enabled_strats = list(MODE2_STRATEGY_LABELS.keys())
+                    open_sides = mode_open_sides(cfg, mode)
 
                     candidate_map = {}
                     for c in sig.get("candidates", []) or []:
@@ -1198,6 +1210,16 @@ def run_worker(cfg):
                         srt["sell_hint"] = csell if isinstance(csell, (int, float)) else None
 
                         if s_side in ("BUY", "SELL"):
+                            if open_sides and s_side not in open_sides:
+                                srt["last_signal"] = "WAIT"
+                                srt["signal_reason"] = f"blocked opposite: mode2 lock {','.join(sorted(open_sides))}"
+                                if sig_time > 0:
+                                    srt["last_time"] = sig_time
+                                log(
+                                    f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] Block {s_side}: direction lock {','.join(sorted(open_sides))}",
+                                    "info",
+                                )
+                                continue
                             active_signals.append(f"{MODE2_STRATEGY_LABELS.get(sid, sid)}:{s_side}")
                             if sig_time > 0 and sig_time != int(srt.get("last_time", 0)):
                                 srt["last_time"] = sig_time
@@ -1213,6 +1235,8 @@ def run_worker(cfg):
                                             f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] Skip open {s_side}: {reason}",
                                             "warn",
                                         )
+                                    else:
+                                        open_sides.add(s_side)
                                 else:
                                     log(
                                         f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] Signal {s_side} but strategy max 1 reached",
