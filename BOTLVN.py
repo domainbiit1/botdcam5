@@ -526,6 +526,10 @@ def compute_mode2_m1_scalp_signal(cfg):
     bb_up_now = float(bb_up.iloc[i]) if np.isfinite(float(bb_up.iloc[i])) else close + a
     bb_dn_now = float(bb_dn.iloc[i]) if np.isfinite(float(bb_dn.iloc[i])) else close - a
 
+    atr_hist = atr_m1.iloc[max(0, i - 288): i + 1].dropna().to_numpy(dtype=float)
+    atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist)) if len(atr_hist) >= 8 else 0.5
+    trend_strength = abs(float(ema20_m5.iloc[-1]) - float(ema50_m5.iloc[-1])) / max(1e-9, a)
+
     side = None
     reason = "no-setup"
     candidates = []
@@ -569,13 +573,31 @@ def compute_mode2_m1_scalp_signal(cfg):
     # 1) Trend pullback: trend M5, entry M1 pullback EMA/VWAP.
     near_ema9 = abs(close - e9) <= 0.35 * a
     near_vwap = abs(close - vwap_now) <= 0.45 * a
+    pullback_min_trend = float(cfg.get("mode2_pullback_min_trend_strength", 0.70))
+    trend_ok = trend_strength >= pullback_min_trend
+    body_size = abs(close - open_)
+    body_ok = body_size >= 0.12 * a
+    buy_confirm = close > open_ and close >= (prev_high - 0.02 * a) and close > e20
+    sell_confirm = close < open_ and close <= (prev_low + 0.02 * a) and close < e20
+    choppy_guard = not (atr_rank >= 0.88 and trend_strength < 0.95)
     if strat_on("trend_pullback"):
-        if trend_buy and (low <= e9 or near_ema9) and close > e9 and (close >= vwap_now or near_vwap):
+        if trend_buy and trend_ok and body_ok and choppy_guard and buy_confirm and (low <= e9 or near_ema9) and close > e9 and (close >= vwap_now or near_vwap):
             add_candidate("BUY", "trend_pullback", "M5 uptrend + M1 pullback EMA9/VWAP", 100, buy_h=e9)
-        elif trend_sell and (high >= e9 or near_ema9) and close < e9 and (close <= vwap_now or near_vwap):
+        elif trend_sell and trend_ok and body_ok and choppy_guard and sell_confirm and (high >= e9 or near_ema9) and close < e9 and (close <= vwap_now or near_vwap):
             add_candidate("SELL", "trend_pullback", "M5 downtrend + M1 pullback EMA9/VWAP", 100, sell_h=e9)
         else:
-            set_wait_status("trend_pullback", "wait pullback EMA9/VWAP theo trend M5", buy_h=e9, sell_h=e9)
+            wait_reason = "wait pullback EMA9/VWAP theo trend M5"
+            if not trend_ok:
+                wait_reason = f"trend yếu ({trend_strength:.2f} < {pullback_min_trend:.2f})"
+            elif not choppy_guard:
+                wait_reason = "nhiễu cao: ATR rank cao, tạm skip pullback"
+            elif not body_ok:
+                wait_reason = "nến xác nhận quá nhỏ"
+            elif trend_buy and not buy_confirm:
+                wait_reason = "buy chưa xác nhận đóng nến"
+            elif trend_sell and not sell_confirm:
+                wait_reason = "sell chưa xác nhận đóng nến"
+            set_wait_status("trend_pullback", wait_reason, buy_h=e9, sell_h=e9)
     else:
         set_wait_status("trend_pullback", "disabled")
 
@@ -674,10 +696,6 @@ def compute_mode2_m1_scalp_signal(cfg):
     sell_hint = min(e9, prev_close - 0.01)
     buy_hint = buy_hint if buy_hint <= e9 + touch_band else None
     sell_hint = sell_hint if sell_hint >= e9 - touch_band else None
-
-    atr_hist = atr_m1.iloc[max(0, i - 288): i + 1].dropna().to_numpy(dtype=float)
-    atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist)) if len(atr_hist) >= 8 else 0.5
-    trend_strength = abs(float(ema20_m5.iloc[-1]) - float(ema50_m5.iloc[-1])) / max(1e-9, a)
 
     ranked = sorted(candidates, key=lambda x: x["priority"], reverse=True)
     if ranked:
