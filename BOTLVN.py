@@ -2632,12 +2632,9 @@ class LVNWindow(QtWidgets.QMainWindow):
             decision_color = "#22c55e" if decision == "TRADE" else "#94a3b8"
             buy_hint = m.get("buy_hint")
             sell_hint = m.get("sell_hint")
-            if state in ("BUY", "SELL"):
-                buy_txt = f"{float(buy_hint):.2f}" if isinstance(buy_hint, (int, float)) else "-"
-                sell_txt = f"{float(sell_hint):.2f}" if isinstance(sell_hint, (int, float)) else "-"
-            else:
-                buy_txt = "-"
-                sell_txt = "-"
+            # Always show computed watch levels when available, even in WAIT/NO TRADE.
+            buy_txt = f"{float(buy_hint):.2f}" if isinstance(buy_hint, (int, float)) else "-"
+            sell_txt = f"{float(sell_hint):.2f}" if isinstance(sell_hint, (int, float)) else "-"
             reason = str(m.get("reason", "-"))
             vals = [str(m.get("mode_label", "-")), str(m.get("strategy_label", "-")), state, decision, sell_txt, buy_txt, reason]
             for c, v in enumerate(vals):
