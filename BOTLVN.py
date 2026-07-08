@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-entry-recovery-v7"
+BOT_BUILD = "2026-07-08-entry-recovery-v8"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -618,6 +618,28 @@ def compute_mode1_lvn_signal(cfg):
         short_near = nearest_level(short_levels, close)
         if isinstance(short_near, (int, float)):
             lvn_main = float(short_near)
+    lvn_dist_atr = abs(close - float(lvn_main)) / max(1e-9, a)
+    if lvn_dist_atr > 1.2:
+        watch_buy = float(lvn_main + 0.06 * a)
+        watch_sell = float(lvn_main - 0.06 * a)
+        summary = (
+            "NO TRADE\n\nLý do:\n- "
+            f"LVN drift xa giá hiện tại (close={close:.2f}, LVN={lvn_main:.2f}, lệch={abs(close-lvn_main):.2f} ~ {lvn_dist_atr:.2f} ATR)\n- "
+            "Mode 1 tạm đứng ngoài, ưu tiên Mode 2 trong pha thị trường này"
+        )
+        return {
+            "side": None,
+            "reason": summary,
+            "m5_time": t_now,
+            "close": close,
+            "atr": a,
+            "lvn": float(lvn_main),
+            "buy_price_hint": watch_buy,
+            "sell_price_hint": watch_sell,
+            "atr_rank": atr_rank,
+            "trend_strength": trend_strength,
+            "strategy_id": "no-trade",
+        }
 
     # Session ranges (UTC for VN timezone behavior).
     ts = pd.to_datetime(df["time"], unit="s")
@@ -1285,7 +1307,9 @@ def compute_mode2_m1_scalp_signal(cfg):
                 miss.append("chưa pullback về EMA/SR")
             if not (bull_confirm or bear_confirm):
                 miss.append("chưa có nến xác nhận")
-            if 45.0 <= rsi_now <= 55.0:
+            if 45.0 <= rsi_now <= 55.0 and not (
+                (trend_buy_15 and near_pull_buy) or (trend_sell_15 and near_pull_sell)
+            ):
                 miss.append("RSI trung tính")
             set_wait_status("trend_pullback", why_missing(miss, "NO TRADE | chưa đủ điều kiện Trend Pullback"), buy_h=float(ema20.iloc[i]), sell_h=float(ema20.iloc[i]))
     else:
@@ -1297,8 +1321,8 @@ def compute_mode2_m1_scalp_signal(cfg):
         r_hi = float(df["high"].iloc[i - range_n:i].max())
         r_lo = float(df["low"].iloc[i - range_n:i].min())
         r_h = max(1e-9, r_hi - r_lo)
-        breakout_body = body >= 0.46 * rng
-        vol_boost = vol_now >= 0.98 * max(1.0, vol_avg)
+        breakout_body = body >= 0.42 * rng
+        vol_boost = vol_now >= 0.95 * max(1.0, vol_avg)
         if trend_buy and r_h >= 1.0 * a and r_h <= 7.5 * a and close > r_hi + 0.03 * a and breakout_body and vol_boost and (res_big - close) > 1.3 * a:
             entry = close
             sl = r_hi - 0.20 * a
