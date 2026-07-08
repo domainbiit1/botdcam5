@@ -1927,6 +1927,7 @@ def run_worker(cfg):
     profile_text = "Auto SL/TP: warming up"
     entry_hint = "-"
     active_mode_label = ", ".join(active_mode_labels)
+    last_heartbeat_t = 0.0
     def _fmt_px(v):
         return f"{float(v):.2f}" if isinstance(v, (int, float)) else "-"
 
@@ -1939,6 +1940,25 @@ def run_worker(cfg):
             now = time.time()
             enabled_modes = get_active_modes(cfg)
             active_mode_label = ", ".join(MODE_LABELS.get(m, m) for m in enabled_modes)
+            if now - last_heartbeat_t >= 60.0:
+                epoch_now = int(now)
+                sec_to_m5_close = (300 - (epoch_now % 300)) % 300
+                if sec_to_m5_close == 0:
+                    sec_to_m5_close = 300
+                mode_bar_state = []
+                for m in enabled_modes:
+                    lt = int(mode_runtime.get(m, {}).get("last_time", 0) or 0)
+                    if lt > 0:
+                        ttxt = datetime.utcfromtimestamp(lt).strftime("%H:%M:%S")
+                    else:
+                        ttxt = "warming"
+                    mode_bar_state.append(f"{MODE_LABELS.get(m, m)}@{ttxt}")
+                log(
+                    f"[HEARTBEAT] worker alive | next M5 close in {sec_to_m5_close}s | "
+                    f"modes={' ; '.join(mode_bar_state) if mode_bar_state else '-'}",
+                    "info",
+                )
+                last_heartbeat_t = now
             cycle_signals = {}
             if MODE_LVN_1 in enabled_modes:
                 sig1 = compute_mode1_lvn_signal(cfg)
