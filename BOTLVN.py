@@ -120,8 +120,20 @@ MODE2_STRATEGY_SHORT = {
     "session_scalp": "ss",
 }
 MODE2_STRATEGY_SHORT_INV = {v: k for k, v in MODE2_STRATEGY_SHORT.items()}
+MODE1_FIXED_PROFILE = "balanced"
+MODE1_PROFILE_RULES = {
+    "safe": {"min_score": 6, "rr_min": 1.30, "tp2_r": 1.50, "lot_factor": 1.0},
+    "balanced": {"min_score": 5, "rr_min": 1.25, "tp2_r": 1.40, "lot_factor": 1.0},
+    "aggressive": {"min_score": 4, "rr_min": 1.20, "tp2_r": 1.30, "lot_factor": 0.5},
+}
+MODE1_SL_MAX = 5.0
+MODE2_MIN_SCORE = 5
+MODE2_RR_MIN = 1.2
+MODE2_SL_MAX = 6.0
+MODE2_SETUP_LOCK_MINUTES = 45
 
 _today_mode_cache = {}
+_setup_lock_cache = {}
 
 
 def send(obj):
@@ -292,6 +304,52 @@ def count_strategy_positions(cfg, mode_id, strategy_id):
     return out
 
 
+def is_setup_temporarily_locked(cfg, mode_id, strategy_id, lock_minutes=45, min_losses=2):
+    if not strategy_id or mode_id != MODE_SCALP_M1_2:
+        return False, 0
+    now = time.time()
+    key = (id(cfg), mode_id, strategy_id, int(lock_minutes), int(min_losses))
+    cached = _setup_lock_cache.get(key)
+    if cached and now - float(cached.get("t", 0.0)) < 10.0:
+        return bool(cached.get("locked", False)), int(cached.get("losses", 0))
+    try:
+        start = datetime.combine(datetime.now().date(), datetime.min.time())
+        deals = mt5.history_deals_get(start, datetime.now())
+        if deals is None:
+            _setup_lock_cache[key] = {"t": now, "locked": False, "losses": 0}
+            return False, 0
+        magic = int(mode_magic(cfg, mode_id))
+        rows = []
+        for d in deals:
+            if int(getattr(d, "magic", 0)) != magic:
+                continue
+            if int(getattr(d, "entry", -1)) != int(mt5.DEAL_ENTRY_OUT):
+                continue
+            sid = strategy_id_from_comment(getattr(d, "comment", ""), mode_id)
+            if sid != strategy_id:
+                continue
+            pnl = float(getattr(d, "profit", 0.0) or 0.0) + float(getattr(d, "swap", 0.0) or 0.0) + float(getattr(d, "commission", 0.0) or 0.0)
+            rows.append((int(getattr(d, "time", 0)), pnl))
+        rows.sort(key=lambda x: x[0])
+        losses = 0
+        last_loss_ts = 0
+        for ts, pnl in reversed(rows):
+            if pnl < 0:
+                losses += 1
+                if last_loss_ts == 0:
+                    last_loss_ts = ts
+            else:
+                break
+        locked = False
+        if losses >= int(min_losses) and last_loss_ts > 0:
+            locked = (now - float(last_loss_ts)) <= float(lock_minutes) * 60.0
+        _setup_lock_cache[key] = {"t": now, "locked": locked, "losses": losses}
+        return locked, losses
+    except Exception:
+        _setup_lock_cache[key] = {"t": now, "locked": False, "losses": 0}
+        return False, 0
+
+
 def mode_open_sides(cfg, mode_id):
     out = set()
     for p in my_positions(cfg, mode_id):
@@ -445,6 +503,12 @@ def build_volume_profile_summary(df, bins=36, value_area=0.70):
     lvn_idx = np.argsort(vol)[: max(3, bins // 8)]
     hvn = sorted(float(centers[k]) for k in hvn_idx)
     lvn = sorted(float(centers[k]) for k in lvn_idx)
+    if best["setup"] == "LVN Rejection":
+        sid = "lvn_rejection"
+    elif best["setup"] == "LVN Breakout Retest":
+        sid = "lvn_breakout_retest"
+    else:
+        sid = "lvn_fast_continuation"
     return {
         "poc": poc,
         "vah": vah,
@@ -610,7 +674,7 @@ def compute_mode1_lvn_signal(cfg):
     tick = mt5.symbol_info_tick(cfg["symbol"])
     if tick is not None:
         spread = abs(float(getattr(tick, "ask", 0.0)) - float(getattr(tick, "bid", 0.0)))
-        if spread > 0.2 * a:
+        if spread > 0.3 * a:
             no_trade.append("Spread quá cao")
 
     # Session preference (VN): London 14:00-17:00, NY 19:30-23:00.
@@ -618,6 +682,14 @@ def compute_mode1_lvn_signal(cfg):
     in_london_ny = (7 * 60 <= minute_utc <= 10 * 60) or (12 * 60 + 30 <= minute_utc <= 16 * 60)
 
     candidates = []
+    profile_name = str(MODE1_FIXED_PROFILE).lower().strip()
+    if profile_name not in MODE1_PROFILE_RULES:
+        profile_name = "balanced"
+    p_rule = MODE1_PROFILE_RULES[profile_name]
+    score_gate = int(p_rule["min_score"])
+    rr_min = float(p_rule["rr_min"])
+    tp2_r = float(p_rule["tp2_r"])
+    lot_factor_default = float(p_rule["lot_factor"])
 
     def hvn_poc_above(px):
         pool = [x for x in ([poc] + hvn_levels + [vah, sr_res, london_hi, asia_hi]) if isinstance(x, (int, float)) and x > px]
@@ -627,7 +699,7 @@ def compute_mode1_lvn_signal(cfg):
         pool = [x for x in ([poc] + hvn_levels + [val, sr_sup, london_lo, asia_lo]) if isinstance(x, (int, float)) and x < px]
         return max(pool) if pool else None
 
-    def add_candidate(setup_name, sig_side, entry, sl, tp1, tp2, base_reason, cancel_rule, confidence, factors):
+    def add_candidate(setup_name, sig_side, entry, sl, tp1, tp2, base_reason, cancel_rule, confidence, factors, lot_factor=1.0):
         if not all(isinstance(x, (int, float)) for x in [entry, sl, tp1, tp2]):
             return
         stop = abs(entry - sl)
@@ -636,10 +708,10 @@ def compute_mode1_lvn_signal(cfg):
         if stop < 2.0:
             sl = entry - 2.0 if sig_side == "BUY" else entry + 2.0
             stop = abs(entry - sl)
-        if stop > 4.5:
+        if stop > float(MODE1_SL_MAX):
             return
         rr = abs(tp2 - entry) / max(1e-9, stop)
-        if rr < 1.5:
+        if rr < rr_min:
             return
         if sig_side == "BUY" and tp1 <= entry:
             return
@@ -647,7 +719,7 @@ def compute_mode1_lvn_signal(cfg):
             return
         # 4/6 high win-rate filter.
         score = int(sum(1 for x in factors if x))
-        if score < 4:
+        if score < score_gate:
             return
         reason_detail = (
             f"Chiến lược: {setup_name}\n"
@@ -677,6 +749,7 @@ def compute_mode1_lvn_signal(cfg):
                 "cancel_rule": str(cancel_rule),
                 "reason": reason_detail,
                 "score": score,
+                "lot_factor": float(lot_factor),
             }
         )
 
@@ -689,8 +762,8 @@ def compute_mode1_lvn_signal(cfg):
             sl = min(low, swing_lo) - 0.30 * a
             tp1_raw = hvn_poc_above(entry)
             tp1 = tp1_raw if isinstance(tp1_raw, (int, float)) else entry + abs(entry - sl)
-            tp2 = max(vah, entry + 1.7 * abs(entry - sl))
-            factors = [support_near, low < min(prev_low, float(prev2["low"])), buy_reject, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= 1.5), in_london_ny]
+            tp2 = max(vah, entry + tp2_r * abs(entry - sl))
+            factors = [support_near, low < min(prev_low, float(prev2["low"])), buy_reject, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= rr_min), in_london_ny]
             add_candidate(
                 "LVN Rejection",
                 "BUY",
@@ -702,6 +775,7 @@ def compute_mode1_lvn_signal(cfg):
                 "Hủy nếu nến M5 đóng lại dưới LVN hoặc RSI rơi dưới 40",
                 8,
                 factors,
+                lot_factor_default,
             )
 
         # Setup 2: LVN Rejection SELL
@@ -712,8 +786,8 @@ def compute_mode1_lvn_signal(cfg):
             sl = max(high, swing_hi) + 0.30 * a
             tp1_raw = hvn_poc_below(entry)
             tp1 = tp1_raw if isinstance(tp1_raw, (int, float)) else entry - abs(entry - sl)
-            tp2 = min(val, entry - 1.7 * abs(entry - sl))
-            factors = [resistance_near, high > max(prev_high, float(prev2["high"])), sell_reject, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= 1.5), in_london_ny]
+            tp2 = min(val, entry - tp2_r * abs(entry - sl))
+            factors = [resistance_near, high > max(prev_high, float(prev2["high"])), sell_reject, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= rr_min), in_london_ny]
             add_candidate(
                 "LVN Rejection",
                 "SELL",
@@ -725,6 +799,7 @@ def compute_mode1_lvn_signal(cfg):
                 "Hủy nếu nến M5 đóng lại trên LVN hoặc RSI vượt 60",
                 8,
                 factors,
+                lot_factor_default,
             )
 
         # Setup 3: LVN Breakout Retest BUY
@@ -736,8 +811,8 @@ def compute_mode1_lvn_signal(cfg):
             sl = min(low, swing_lo, lvn_main) - 0.28 * a
             tp1_raw = hvn_poc_above(entry)
             tp1 = tp1_raw if isinstance(tp1_raw, (int, float)) else entry + abs(entry - sl)
-            tp2 = max(vah, entry + 1.8 * abs(entry - sl))
-            factors = [abs(lvn_main - sr_sup) <= 0.7 * a, low < prev_low, retest_up, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= 1.5), in_london_ny]
+            tp2 = max(vah, entry + min(2.0, max(1.3, tp2_r + 0.1)) * abs(entry - sl))
+            factors = [abs(lvn_main - sr_sup) <= 0.7 * a, low < prev_low, retest_up, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= rr_min), in_london_ny]
             add_candidate(
                 "LVN Breakout Retest",
                 "BUY",
@@ -749,6 +824,7 @@ def compute_mode1_lvn_signal(cfg):
                 "Hủy nếu nến M5 đóng lại dưới LVN",
                 8,
                 factors,
+                lot_factor_default,
             )
 
         # Setup 4: LVN Breakout Retest SELL
@@ -759,8 +835,8 @@ def compute_mode1_lvn_signal(cfg):
             sl = max(high, swing_hi, lvn_main) + 0.28 * a
             tp1_raw = hvn_poc_below(entry)
             tp1 = tp1_raw if isinstance(tp1_raw, (int, float)) else entry - abs(entry - sl)
-            tp2 = min(val, entry - 1.8 * abs(entry - sl))
-            factors = [abs(lvn_main - sr_res) <= 0.7 * a, high > prev_high, retest_dn, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= 1.5), in_london_ny]
+            tp2 = min(val, entry - min(2.0, max(1.3, tp2_r + 0.1)) * abs(entry - sl))
+            factors = [abs(lvn_main - sr_res) <= 0.7 * a, high > prev_high, retest_dn, isinstance(tp1_raw, (int, float)), (abs(tp2 - entry) / max(1e-9, abs(entry - sl)) >= rr_min), in_london_ny]
             add_candidate(
                 "LVN Breakout Retest",
                 "SELL",
@@ -772,6 +848,51 @@ def compute_mode1_lvn_signal(cfg):
                 "Hủy nếu nến M5 đóng lại trên LVN",
                 8,
                 factors,
+                lot_factor_default,
+            )
+
+        # Setup 5: LVN Fast Continuation (nới để không bỏ sóng mạnh)
+        cont_buy = close > lvn_main + 0.10 * a and body >= 0.55 * rng and (float(ema20.iloc[i]) > float(ema50.iloc[i]) or close > float(ema20.iloc[i])) and rsi_now > 50
+        cont_sell = close < lvn_main - 0.10 * a and body >= 0.55 * rng and (float(ema20.iloc[i]) < float(ema50.iloc[i]) or close < float(ema20.iloc[i])) and rsi_now < 50
+        if in_london_ny and cont_buy and body <= 2.6 * a:
+            entry = close
+            sl = min(low, lvn_main) - 0.20 * a
+            stop = abs(entry - sl)
+            tp1 = entry + stop
+            tp2 = entry + max(1.3, min(1.5, tp2_r)) * stop
+            factors = [close > lvn_main, body >= 0.55 * rng, rsi_now > 50, close > float(ema20.iloc[i]), in_london_ny, (tp2 > tp1)]
+            add_candidate(
+                "LVN Fast Continuation",
+                "BUY",
+                entry,
+                sl,
+                tp1,
+                tp2,
+                "Breakout/continuation qua LVN với nến M5 thân khá mạnh.",
+                "Hủy nếu nến M5 đóng ngược lại dưới LVN",
+                7,
+                factors,
+                min(0.7, lot_factor_default),
+            )
+        if in_london_ny and cont_sell and body <= 2.6 * a:
+            entry = close
+            sl = max(high, lvn_main) + 0.20 * a
+            stop = abs(entry - sl)
+            tp1 = entry - stop
+            tp2 = entry - max(1.3, min(1.5, tp2_r)) * stop
+            factors = [close < lvn_main, body >= 0.55 * rng, rsi_now < 50, close < float(ema20.iloc[i]), in_london_ny, (tp2 < tp1)]
+            add_candidate(
+                "LVN Fast Continuation",
+                "SELL",
+                entry,
+                sl,
+                tp1,
+                tp2,
+                "Breakdown/continuation qua LVN với nến M5 thân khá mạnh.",
+                "Hủy nếu nến M5 đóng ngược lại trên LVN",
+                7,
+                factors,
+                min(0.7, lot_factor_default),
             )
 
     if not candidates:
@@ -780,7 +901,7 @@ def compute_mode1_lvn_signal(cfg):
             reasons = [
                 "Không có LVN rõ",
                 "Không có nến xác nhận",
-                "RR không đủ 1:1.5",
+                f"RR không đủ {rr_min:.2f}",
             ]
         summary = "NO TRADE\n\nLý do:\n- " + "\n- ".join(reasons[:4])
         return {
@@ -816,8 +937,9 @@ def compute_mode1_lvn_signal(cfg):
         "rr": best["rr"],
         "confidence": best["confidence"],
         "cancel_rule": best["cancel_rule"],
-        "strategy_id": "lvn_rejection" if best["setup"] == "LVN Rejection" else "lvn_breakout_retest",
+        "strategy_id": sid,
         "tp": best["tp2"],
+        "lot_factor": float(best.get("lot_factor", lot_factor_default)),
     }
 
 
@@ -936,11 +1058,11 @@ def compute_mode2_m1_scalp_signal(cfg):
             "sell_hint": sell_h if isinstance(sell_h, (int, float)) else None,
         }
 
-    def build_trade(sid, sig_side, entry, sl, tp1, tp2, why, cancel_rule, confidence, priority, confirm_count):
-        if int(confirm_count) < 4:
+    def build_trade(sid, sig_side, entry, sl, tp1, tp2, why, cancel_rule, confidence, priority, confirm_count, lot_factor=1.0):
+        if int(confirm_count) < int(MODE2_MIN_SCORE):
             set_wait_status(
                 sid,
-                "NO TRADE | tín hiệu trung bình (<4/6 yếu tố)",
+                f"NO TRADE | điểm tín hiệu thấp (<{MODE2_MIN_SCORE}/10)",
                 buy_h=entry if sig_side == "BUY" else None,
                 sell_h=entry if sig_side == "SELL" else None,
             )
@@ -952,23 +1074,23 @@ def compute_mode2_m1_scalp_signal(cfg):
         if stop < 2.0:
             sl = float(entry) - 2.0 if sig_side == "BUY" else float(entry) + 2.0
             stop = abs(float(entry) - float(sl))
-        if stop > 3.5:
+        if stop > float(MODE2_SL_MAX):
             set_wait_status(sid, "NO TRADE | Không có SL hợp lý (SL quá xa)", buy_h=entry if sig_side == "BUY" else None, sell_h=entry if sig_side == "SELL" else None)
             return
         if sig_side == "BUY":
             tp1 = max(float(tp1), float(entry) + stop * 1.0)
-            tp2 = max(float(tp2), float(entry) + stop * 1.5)
+            tp2 = max(float(tp2), float(entry) + stop * 1.3)
             if tp2 <= float(entry):
                 set_wait_status(sid, "NO TRADE | TP không hợp lệ", buy_h=entry)
                 return
         else:
             tp1 = min(float(tp1), float(entry) - stop * 1.0)
-            tp2 = min(float(tp2), float(entry) - stop * 1.5)
+            tp2 = min(float(tp2), float(entry) - stop * 1.3)
             if tp2 >= float(entry):
                 set_wait_status(sid, "NO TRADE | TP không hợp lệ", sell_h=entry)
                 return
         rr = abs(float(tp2) - float(entry)) / max(1e-9, stop)
-        if rr < 1.2:
+        if rr < float(MODE2_RR_MIN):
             set_wait_status(sid, "NO TRADE | Không đủ RR (<1:1.2)", buy_h=entry if sig_side == "BUY" else None, sell_h=entry if sig_side == "SELL" else None)
             return
         if abs(float(entry) - range_mid_60) <= 0.15 * max(1e-9, range_w_40):
@@ -993,6 +1115,9 @@ def compute_mode2_m1_scalp_signal(cfg):
                 "rr": float(rr),
                 "confidence": int(confidence),
                 "cancel_rule": str(cancel_rule),
+                "score": int(confirm_count),
+                "sl_dist": float(stop),
+                "lot_factor": float(lot_factor),
                 "buy_hint": float(entry) if sig_side == "BUY" else None,
                 "sell_hint": float(entry) if sig_side == "SELL" else None,
             }
@@ -1027,8 +1152,8 @@ def compute_mode2_m1_scalp_signal(cfg):
     tick = mt5.symbol_info_tick(cfg["symbol"])
     if tick is not None:
         spread = abs(float(getattr(tick, "ask", 0.0)) - float(getattr(tick, "bid", 0.0)))
-        if spread > 0.2 * a:
-            no_trade_reasons.append("Spread cao hơn 20% ATR M5")
+        if spread > 0.3 * a:
+            no_trade_reasons.append("Spread cao hơn 30% ATR M5")
 
     if no_trade_reasons:
         base_reason = "NO TRADE | " + " ; ".join(no_trade_reasons[:3])
@@ -1087,26 +1212,26 @@ def compute_mode2_m1_scalp_signal(cfg):
             sl = r_hi - 0.20 * a
             tp1 = entry + max(r_h, abs(entry - sl))
             tp2 = min(res_big, entry + 1.8 * abs(entry - sl)) if res_big > entry else entry + 1.8 * abs(entry - sl)
-            build_trade("breakout", "BUY", entry, sl, tp1, tp2, "tích lũy 8-15 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 95, 5)
+            build_trade("breakout", "BUY", entry, sl, tp1, tp2, "tích lũy 8-15 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 85, 5)
         elif trend_sell and r_h >= 1.0 * a and r_h <= 7.5 * a and close < r_lo - 0.03 * a and breakout_body and vol_boost and (close - sup_big) > 1.3 * a:
             entry = close
             sl = r_lo + 0.20 * a
             tp1 = entry - max(r_h, abs(entry - sl))
             tp2 = max(sup_big, entry - 1.8 * abs(entry - sl)) if sup_big < entry else entry - 1.8 * abs(entry - sl)
-            build_trade("breakout", "SELL", entry, sl, tp1, tp2, "tích lũy 8-15 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 95, 5)
+            build_trade("breakout", "SELL", entry, sl, tp1, tp2, "tích lũy 8-15 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 85, 5)
         # Impulse continuation fallback: allow strong directional break without perfect retest.
         elif trend_sell and close < r_lo - 0.25 * a and body >= 0.75 * rng and vol_now >= 1.25 * max(1.0, vol_avg) and (close - sup_big) > 1.8 * a:
             entry = close
             sl = max(high, r_lo) + 0.22 * a
             tp1 = entry - abs(entry - sl)
             tp2 = max(sup_big, entry - 1.7 * abs(entry - sl))
-            build_trade("breakout", "SELL", entry, sl, tp1, tp2, "impulse breakdown continuation (không retest chuẩn)", "Hủy nếu nến M5 đóng lại trên đáy range vừa phá", 7, 94, 4)
+            build_trade("breakout", "SELL", entry, sl, tp1, tp2, "impulse breakdown continuation (không retest chuẩn)", "Hủy nếu nến M5 đóng lại trên đáy range vừa phá", 7, 60, 5, 0.5)
         elif trend_buy and close > r_hi + 0.25 * a and body >= 0.75 * rng and vol_now >= 1.25 * max(1.0, vol_avg) and (res_big - close) > 1.8 * a:
             entry = close
             sl = min(low, r_hi) - 0.22 * a
             tp1 = entry + abs(entry - sl)
             tp2 = min(res_big, entry + 1.7 * abs(entry - sl))
-            build_trade("breakout", "BUY", entry, sl, tp1, tp2, "impulse breakout continuation (không retest chuẩn)", "Hủy nếu nến M5 đóng lại dưới đỉnh range vừa phá", 7, 94, 4)
+            build_trade("breakout", "BUY", entry, sl, tp1, tp2, "impulse breakout continuation (không retest chuẩn)", "Hủy nếu nến M5 đóng lại dưới đỉnh range vừa phá", 7, 60, 5, 0.5)
         else:
             set_wait_status("breakout", "NO TRADE | breakout chưa rõ hoặc thiếu retest/volume", buy_h=r_hi, sell_h=r_lo)
     else:
@@ -1120,13 +1245,13 @@ def compute_mode2_m1_scalp_signal(cfg):
             sl = min(low - 0.15 * a, range_lo_20 - 0.10 * a)
             tp1 = bb_mid_now
             tp2 = min(range_hi_20, entry + 1.7 * abs(entry - sl))
-            build_trade("mean_reversion", "BUY", entry, sl, tp1, tp2, "sideway + chạm BB dưới + RSI quá bán", "Hủy nếu breakdown thật sự dưới range", 7, 80, 4)
+            build_trade("mean_reversion", "BUY", entry, sl, tp1, tp2, "sideway + chạm BB dưới + RSI quá bán", "Hủy nếu breakdown thật sự dưới range", 7, 70, 5)
         elif sideway_ok and high >= bb_up_now and close < bb_up_now and rsi_now >= 67:
             entry = close
             sl = max(high + 0.15 * a, range_hi_20 + 0.10 * a)
             tp1 = bb_mid_now
             tp2 = max(range_lo_20, entry - 1.7 * abs(entry - sl))
-            build_trade("mean_reversion", "SELL", entry, sl, tp1, tp2, "sideway + chạm BB trên + RSI quá mua", "Hủy nếu breakout thật sự khỏi range", 7, 80, 4)
+            build_trade("mean_reversion", "SELL", entry, sl, tp1, tp2, "sideway + chạm BB trên + RSI quá mua", "Hủy nếu breakout thật sự khỏi range", 7, 70, 5)
         else:
             set_wait_status("mean_reversion", "NO TRADE | chưa đủ điều kiện Mean Reversion", buy_h=bb_dn_now, sell_h=bb_up_now)
     else:
@@ -1147,13 +1272,13 @@ def compute_mode2_m1_scalp_signal(cfg):
             sl = min(low - 0.12 * a, swing_lo - 0.10 * a)
             tp1 = min(resistance, entry + 1.2 * abs(entry - sl)) if resistance > entry else entry + 1.2 * abs(entry - sl)
             tp2 = min(res_big, entry + 1.8 * abs(entry - sl)) if res_big > entry else entry + 1.8 * abs(entry - sl)
-            build_trade("reversal_pa", "BUY", entry, sl, tp1, tp2, "chạm hỗ trợ mạnh + tín hiệu đảo chiều PA", "Hủy nếu nến xác nhận kế tiếp đóng dưới đáy quét", 8, 78, 4)
+            build_trade("reversal_pa", "BUY", entry, sl, tp1, tp2, "chạm hỗ trợ mạnh + tín hiệu đảo chiều PA", "Hủy nếu nến xác nhận kế tiếp đóng dưới đáy quét", 8, 110, 5)
         elif touch_res and (bearish_engulf or bearish_pin or evening_star):
             entry = close
             sl = max(high + 0.12 * a, swing_hi + 0.10 * a)
             tp1 = max(support, entry - 1.2 * abs(entry - sl)) if support < entry else entry - 1.2 * abs(entry - sl)
             tp2 = max(sup_big, entry - 1.8 * abs(entry - sl)) if sup_big < entry else entry - 1.8 * abs(entry - sl)
-            build_trade("reversal_pa", "SELL", entry, sl, tp1, tp2, "chạm kháng cự mạnh + tín hiệu đảo chiều PA", "Hủy nếu nến xác nhận kế tiếp đóng trên đỉnh quét", 8, 78, 4)
+            build_trade("reversal_pa", "SELL", entry, sl, tp1, tp2, "chạm kháng cự mạnh + tín hiệu đảo chiều PA", "Hủy nếu nến xác nhận kế tiếp đóng trên đỉnh quét", 8, 110, 5)
         else:
             set_wait_status("reversal_pa", "NO TRADE | chưa có PA đảo chiều tại vùng mạnh", buy_h=sup_big, sell_h=res_big)
     else:
@@ -1172,13 +1297,13 @@ def compute_mode2_m1_scalp_signal(cfg):
             sl = low - 0.12 * a
             tp1 = swing_hi
             tp2 = min(resistance, entry + 2.0 * abs(entry - sl)) if resistance > entry else entry + 2.0 * abs(entry - sl)
-            build_trade("orderflow_proxy", "BUY", entry, sl, tp1, tp2, "quét đáy + CHOCH tăng + retest vùng phá cấu trúc", "Hủy nếu phá xuống dưới đáy quét", 7, 76, 4)
+            build_trade("orderflow_proxy", "BUY", entry, sl, tp1, tp2, "quét đáy + CHOCH tăng + retest vùng phá cấu trúc", "Hủy nếu phá xuống dưới đáy quét", 7, 95, 5)
         elif choch_dn and not trend_buy:
             entry = close
             sl = high + 0.12 * a
             tp1 = swing_lo
             tp2 = max(support, entry - 2.0 * abs(entry - sl)) if support < entry else entry - 2.0 * abs(entry - sl)
-            build_trade("orderflow_proxy", "SELL", entry, sl, tp1, tp2, "quét đỉnh + CHOCH giảm + retest vùng phá cấu trúc", "Hủy nếu phá lên trên đỉnh quét", 7, 76, 4)
+            build_trade("orderflow_proxy", "SELL", entry, sl, tp1, tp2, "quét đỉnh + CHOCH giảm + retest vùng phá cấu trúc", "Hủy nếu phá lên trên đỉnh quét", 7, 95, 5)
         else:
             set_wait_status("orderflow_proxy", "NO TRADE | chưa có CHOCH rõ + retest", buy_h=micro_hi, sell_h=micro_lo)
     else:
@@ -1204,13 +1329,13 @@ def compute_mode2_m1_scalp_signal(cfg):
                 sl = low - 0.12 * a
                 tp1 = asia_mid
                 tp2 = min(asia_hi, entry + 1.8 * abs(entry - sl))
-                build_trade("session_scalp", "BUY", entry, sl, tp1, tp2, "quét đáy phiên Á rồi đóng lại trong range", "Hủy nếu đóng dưới đáy quét phiên Á", 8, 90, 5)
+                build_trade("session_scalp", "BUY", entry, sl, tp1, tp2, "quét đáy phiên Á rồi đóng lại trong range", "Hủy nếu đóng dưới đáy quét phiên Á", 8, 120, 5)
             elif sweep_asia_high:
                 entry = close
                 sl = high + 0.12 * a
                 tp1 = asia_mid
                 tp2 = max(asia_lo, entry - 1.8 * abs(entry - sl))
-                build_trade("session_scalp", "SELL", entry, sl, tp1, tp2, "quét đỉnh phiên Á rồi đóng lại trong range", "Hủy nếu đóng trên đỉnh quét phiên Á", 8, 90, 5)
+                build_trade("session_scalp", "SELL", entry, sl, tp1, tp2, "quét đỉnh phiên Á rồi đóng lại trong range", "Hủy nếu đóng trên đỉnh quét phiên Á", 8, 120, 5)
             else:
                 set_wait_status("session_scalp", "NO TRADE | chưa có sweep range phiên Á + nến xác nhận", buy_h=asia_lo, sell_h=asia_hi)
         elif in_session:
@@ -1220,7 +1345,16 @@ def compute_mode2_m1_scalp_signal(cfg):
     else:
         set_wait_status("session_scalp", "disabled")
 
-    ranked = sorted(candidates, key=lambda x: x["priority"], reverse=True)
+    ranked = sorted(
+        candidates,
+        key=lambda x: (
+            int(x.get("priority", 0)),
+            int(x.get("score", 0)),
+            -float(x.get("sl_dist", 9999.0)),
+            float(x.get("rr", 0.0)),
+        ),
+        reverse=True,
+    )
     if ranked:
         best = ranked[0]
         side = best["side"]
@@ -1412,6 +1546,11 @@ def open_trade(cfg, side, signal):
             otype = mt5.ORDER_TYPE_SELL
 
     lot = lot_from_risk(cfg, stop_dist)
+    lot_factor = float(signal.get("lot_factor", 1.0) or 1.0)
+    if lot_factor < 0.05:
+        lot_factor = 0.05
+    if lot_factor != 1.0:
+        lot = round_lot(float(lot) * lot_factor, info)
     if lot <= 0:
         return False, "lot <= 0"
 
@@ -1704,6 +1843,8 @@ def run_worker(cfg):
                         mode_runtime[mode]["strategy_label"] = "LVN Rejection"
                     elif sid == "lvn_breakout_retest":
                         mode_runtime[mode]["strategy_label"] = "LVN Breakout Retest"
+                    elif sid == "lvn_fast_continuation":
+                        mode_runtime[mode]["strategy_label"] = "LVN Fast Continuation"
                     elif str(s_reason).startswith("NO TRADE"):
                         mode_runtime[mode]["strategy_label"] = "NO TRADE"
                     else:
@@ -1815,6 +1956,19 @@ def run_worker(cfg):
                                 srt["last_time"] = sig_time
                                 current_open = count_strategy_positions(cfg, mode, sid)
                                 if current_open < 1:
+                                    locked, loss_streak = is_setup_temporarily_locked(
+                                        cfg,
+                                        mode,
+                                        sid,
+                                        lock_minutes=MODE2_SETUP_LOCK_MINUTES,
+                                        min_losses=2,
+                                    )
+                                    if locked:
+                                        srt["last_signal"] = "WAIT"
+                                        srt["signal_reason"] = (
+                                            f"NO TRADE | setup lock {MODE2_SETUP_LOCK_MINUTES}m sau {loss_streak} lệnh thua liên tiếp"
+                                        )
+                                        continue
                                     s_sig = dict(sig)
                                     s_sig["strategy_id"] = sid
                                     s_sig["side"] = s_side
