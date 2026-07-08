@@ -503,12 +503,6 @@ def build_volume_profile_summary(df, bins=36, value_area=0.70):
     lvn_idx = np.argsort(vol)[: max(3, bins // 8)]
     hvn = sorted(float(centers[k]) for k in hvn_idx)
     lvn = sorted(float(centers[k]) for k in lvn_idx)
-    if best["setup"] == "LVN Rejection":
-        sid = "lvn_rejection"
-    elif best["setup"] == "LVN Breakout Retest":
-        sid = "lvn_breakout_retest"
-    else:
-        sid = "lvn_fast_continuation"
     return {
         "poc": poc,
         "vah": vah,
@@ -920,6 +914,12 @@ def compute_mode1_lvn_signal(cfg):
     # Prioritize setup quality by RR then confidence.
     candidates.sort(key=lambda x: (x["rr"], x["confidence"], x["score"]), reverse=True)
     best = candidates[0]
+    if best["setup"] == "LVN Rejection":
+        sid = "lvn_rejection"
+    elif best["setup"] == "LVN Breakout Retest":
+        sid = "lvn_breakout_retest"
+    else:
+        sid = "lvn_fast_continuation"
     return {
         "side": best["side"],
         "reason": best["reason"],
