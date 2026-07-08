@@ -91,7 +91,7 @@ MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
 MODE_LABELS = {
     MODE_LVN_1: "Mode 1 - LVN Adaptive",
-    MODE_SCALP_M1_2: "Mode 2 - M1 Scalp Multi-Strategy",
+    MODE_SCALP_M1_2: "Mode 2 - M5 Scalp Multi-Strategy",
 }
 MODE_MAGIC_OFFSETS = {
     MODE_LVN_1: 11,
@@ -506,11 +506,12 @@ def get_active_modes(cfg):
 
 
 def compute_mode2_m1_scalp_signal(cfg):
-    bars = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M1, 0, 700)
-    if bars is None or len(bars) < 150:
+    # Mode 2 tuned to reduce noise: execute on M5, confirm trend on M15.
+    bars = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M5, 0, 700)
+    if bars is None or len(bars) < 180:
         return None
     df = pd.DataFrame(bars).iloc[:-1].reset_index(drop=True)  # closed bars only
-    if len(df) < 220:
+    if len(df) < 260:
         return None
 
     atr_m1 = atr_series(df, 14)
@@ -530,14 +531,14 @@ def compute_mode2_m1_scalp_signal(cfg):
     vwap_den = vol.groupby(day_key).cumsum().clip(lower=1.0)
     vwap = vwap_num / vwap_den
 
-    bars_m5 = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M5, 0, 260)
-    if bars_m5 is None or len(bars_m5) < 100:
+    bars_m15 = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M15, 0, 320)
+    if bars_m15 is None or len(bars_m15) < 120:
         return None
-    d5 = pd.DataFrame(bars_m5).iloc[:-1].reset_index(drop=True)
-    ema20_m5 = d5["close"].ewm(span=20, adjust=False).mean()
-    ema50_m5 = d5["close"].ewm(span=50, adjust=False).mean()
-    trend_buy = float(ema20_m5.iloc[-1]) > float(ema50_m5.iloc[-1])
-    trend_sell = float(ema20_m5.iloc[-1]) < float(ema50_m5.iloc[-1])
+    d15 = pd.DataFrame(bars_m15).iloc[:-1].reset_index(drop=True)
+    ema20_m15 = d15["close"].ewm(span=20, adjust=False).mean()
+    ema50_m15 = d15["close"].ewm(span=50, adjust=False).mean()
+    trend_buy = float(ema20_m15.iloc[-1]) > float(ema50_m15.iloc[-1])
+    trend_sell = float(ema20_m15.iloc[-1]) < float(ema50_m15.iloc[-1])
     trend_flat = not trend_buy and not trend_sell
 
     i = len(df) - 1
@@ -566,7 +567,7 @@ def compute_mode2_m1_scalp_signal(cfg):
 
     atr_hist = atr_m1.iloc[max(0, i - 288): i + 1].dropna().to_numpy(dtype=float)
     atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist)) if len(atr_hist) >= 8 else 0.5
-    trend_strength = abs(float(ema20_m5.iloc[-1]) - float(ema50_m5.iloc[-1])) / max(1e-9, a)
+    trend_strength = abs(float(ema20_m15.iloc[-1]) - float(ema50_m15.iloc[-1])) / max(1e-9, a)
 
     side = None
     reason = "no-setup"
@@ -608,7 +609,7 @@ def compute_mode2_m1_scalp_signal(cfg):
             "sell_hint": sell_h if isinstance(sell_h, (int, float)) else None,
         }
 
-    # 1) Trend pullback: trend M5, entry M1 pullback EMA/VWAP.
+    # 1) Trend pullback: trend M15, entry M5 pullback EMA/VWAP.
     near_ema9 = abs(close - e9) <= 0.35 * a
     near_vwap = abs(close - vwap_now) <= 0.45 * a
     pullback_min_trend = float(cfg.get("mode2_pullback_min_trend_strength", 0.70))
@@ -620,11 +621,11 @@ def compute_mode2_m1_scalp_signal(cfg):
     choppy_guard = not (atr_rank >= 0.88 and trend_strength < 0.95)
     if strat_on("trend_pullback"):
         if trend_buy and trend_ok and body_ok and choppy_guard and buy_confirm and (low <= e9 or near_ema9) and close > e9 and (close >= vwap_now or near_vwap):
-            add_candidate("BUY", "trend_pullback", "M5 uptrend + M1 pullback EMA9/VWAP", 100, buy_h=e9)
+            add_candidate("BUY", "trend_pullback", "M15 uptrend + M5 pullback EMA9/VWAP", 100, buy_h=e9)
         elif trend_sell and trend_ok and body_ok and choppy_guard and sell_confirm and (high >= e9 or near_ema9) and close < e9 and (close <= vwap_now or near_vwap):
-            add_candidate("SELL", "trend_pullback", "M5 downtrend + M1 pullback EMA9/VWAP", 100, sell_h=e9)
+            add_candidate("SELL", "trend_pullback", "M15 downtrend + M5 pullback EMA9/VWAP", 100, sell_h=e9)
         else:
-            wait_reason = "wait pullback EMA9/VWAP theo trend M5"
+            wait_reason = "wait pullback EMA9/VWAP theo trend M15"
             if not trend_ok:
                 wait_reason = f"trend yếu ({trend_strength:.2f} < {pullback_min_trend:.2f})"
             elif not choppy_guard:
@@ -741,7 +742,7 @@ def compute_mode2_m1_scalp_signal(cfg):
         side = best["side"]
         reason = f"{best['label']} | {best['reason']} | candidates={len(ranked)}"
     elif trend_flat:
-        reason = "no-setup: M5 trend neutral"
+        reason = "no-setup: M15 trend neutral"
 
     return {
         "side": side,
@@ -1799,7 +1800,7 @@ class LVNWindow(QtWidgets.QMainWindow):
         self.lb_equity.setText(f"{eq:,.2f} {cur}".strip())
         self.lb_float.setText(f"{fl:+,.2f} {cur}".strip())
         self.lb_positions.setText(str(int(obj.get("open_positions", 0))))
-        self.lb_signal.setText(f"Signal realtime theo mode (M5/M1 closed bars) | Active: {obj.get('active_mode', '-')}")
+        self.lb_signal.setText(f"Signal realtime theo mode (M5/M15 closed bars) | Active: {obj.get('active_mode', '-')}")
         self.lb_auto_profile.setText(f"Auto profile: {obj.get('profile_text', '-')}")
         self.lb_strategy.setText(f"ACTIVE: {obj.get('active_mode', 'Mode 1 - LVN Adaptive')} | Max position = 1")
         self.lb_runtime_state.setText("ONLINE")
