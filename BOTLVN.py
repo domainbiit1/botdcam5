@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-mode2-all6-v14"
+BOT_BUILD = "2026-07-08-mode2-all6-v15"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -603,6 +603,10 @@ def compute_mode1_lvn_signal(cfg):
             "strategy_id": "no-trade",
         }
 
+    atr_hist = atr.iloc[max(0, i - 288): i + 1].dropna().to_numpy(dtype=float)
+    atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist)) if len(atr_hist) >= 8 else 0.5
+    trend_strength = abs(float(e20_15.iloc[-1]) - float(e50_15.iloc[-1])) / max(1e-9, a)
+
     lvn_main = nearest_level(lvn_levels, close)
     if lvn_main is None:
         lvn_main = close
@@ -620,13 +624,23 @@ def compute_mode1_lvn_signal(cfg):
         if isinstance(short_near, (int, float)):
             lvn_main = float(short_near)
     lvn_dist_atr = abs(close - float(lvn_main)) / max(1e-9, a)
-    max_lvn_dist_atr = float(cfg.get("mode1_lvn_max_dist_atr", 0.9))
+    cfg_cap = float(cfg.get("mode1_lvn_max_dist_atr", 0.9))
+    if atr_rank < 0.35:
+        regime_cap = 0.6
+        regime_label = "calm"
+    elif atr_rank < 0.75:
+        regime_cap = 0.8
+        regime_label = "normal"
+    else:
+        regime_cap = 1.0
+        regime_label = "volatile"
+    max_lvn_dist_atr = min(cfg_cap, regime_cap)
     if lvn_dist_atr > max_lvn_dist_atr:
         watch_buy = float(lvn_main + 0.06 * a)
         watch_sell = float(lvn_main - 0.06 * a)
         summary = (
             "NO TRADE\n\nLý do:\n- "
-            f"LVN drift xa giá hiện tại (close={close:.2f}, LVN={lvn_main:.2f}, lệch={abs(close-lvn_main):.2f} ~ {lvn_dist_atr:.2f} ATR)\n- "
+            f"LVN drift xa giá hiện tại (close={close:.2f}, LVN={lvn_main:.2f}, lệch={abs(close-lvn_main):.2f} ~ {lvn_dist_atr:.2f} ATR, cap={max_lvn_dist_atr:.2f} [{regime_label}])\n- "
             "Mode 1 tạm đứng ngoài, ưu tiên Mode 2 trong pha thị trường này"
         )
         return {
@@ -638,8 +652,8 @@ def compute_mode1_lvn_signal(cfg):
             "lvn": float(lvn_main),
             "buy_price_hint": watch_buy,
             "sell_price_hint": watch_sell,
-            "atr_rank": 0.5,
-            "trend_strength": 0.0,
+            "atr_rank": atr_rank,
+            "trend_strength": trend_strength,
             "strategy_id": "no-trade",
         }
 
@@ -659,9 +673,6 @@ def compute_mode1_lvn_signal(cfg):
     swing_lo = float(df["low"].iloc[i - 16:i].min())
     swing_hi = float(df["high"].iloc[i - 16:i].max())
 
-    atr_hist = atr.iloc[max(0, i - 288): i + 1].dropna().to_numpy(dtype=float)
-    atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist)) if len(atr_hist) >= 8 else 0.5
-    trend_strength = abs(float(e20_15.iloc[-1]) - float(e50_15.iloc[-1])) / max(1e-9, a)
     rsi_now = float(rsi.iloc[i])
     rsi_prev = float(rsi.iloc[i - 1])
     body = abs(close - open_)
@@ -1283,11 +1294,25 @@ def compute_mode2_m1_scalp_signal(cfg):
     if strat_on("trend_pullback"):
         bull_reject = close > open_ and (min(open_, close) - low) >= 0.35 * rng
         bear_reject = close < open_ and (high - max(open_, close)) >= 0.35 * rng
-        bull_confirm = bull_reject or (close > prev_close and close > float(ema20.iloc[i]) and body >= 0.45 * rng)
-        bear_confirm = bear_reject or (close < prev_close and close < float(ema20.iloc[i]) and body >= 0.45 * rng)
-        # v14: softer trend gate for pullback in transition phases.
-        buy_trend_ok = trend_buy_15 or (trend_buy_h1 and close > float(ema20.iloc[i]))
-        sell_trend_ok = trend_sell_15 or (trend_sell_h1 and close < float(ema20.iloc[i]))
+        ema20_now = float(ema20.iloc[i])
+        ema20_prev = float(ema20.iloc[i - 1])
+        ema20_prev2 = float(ema20.iloc[i - 2])
+        ema20_slope_up = (ema20_now - ema20_prev) > 0.015 * a and (ema20_prev - ema20_prev2) > 0.0
+        ema20_slope_dn = (ema20_prev - ema20_now) > 0.015 * a and (ema20_prev2 - ema20_prev) > 0.0
+        closes3 = df["close"].iloc[i - 2:i + 1].astype(float)
+        hold_above_ema20 = bool((closes3 >= ema20_now - 0.08 * a).all())
+        hold_below_ema20 = bool((closes3 <= ema20_now + 0.08 * a).all())
+        micro_hi_lookback = float(df["high"].iloc[i - 6:i - 1].max())
+        micro_lo_lookback = float(df["low"].iloc[i - 6:i - 1].min())
+        choch_up = close > micro_hi_lookback + 0.04 * a
+        choch_dn = close < micro_lo_lookback - 0.04 * a
+        bull_confirm = bull_reject or (close > prev_close and close > ema20_now and body >= 0.45 * rng) or (ema20_slope_up and hold_above_ema20 and choch_up)
+        bear_confirm = bear_reject or (close < prev_close and close < ema20_now and body >= 0.45 * rng) or (ema20_slope_dn and hold_below_ema20 and choch_dn)
+        # v15: transition-friendly trend gate with EMA20 slope + micro-structure support.
+        buy_transition_ok = trend_buy_h1 and ema20_slope_up and hold_above_ema20 and choch_up
+        sell_transition_ok = trend_sell_h1 and ema20_slope_dn and hold_below_ema20 and choch_dn
+        buy_trend_ok = trend_buy_15 or buy_transition_ok
+        sell_trend_ok = trend_sell_15 or sell_transition_ok
         near_pull_buy = low <= float(ema20.iloc[i]) + 0.15 * a or low <= float(ema50.iloc[i]) + 0.12 * a or abs(close - support) <= 0.35 * a
         near_pull_sell = high >= float(ema20.iloc[i]) - 0.15 * a or high >= float(ema50.iloc[i]) - 0.12 * a or abs(close - resistance) <= 0.35 * a
         fast_buy = trend_buy and close > float(ema20.iloc[i]) and body >= 0.58 * rng and vol_now >= 1.05 * max(1.0, vol_avg) and rsi_now >= 47
@@ -1301,6 +1326,8 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp1 = entry + abs(entry - sl)
             tp2 = min(resistance, entry + 1.9 * abs(entry - sl)) if resistance > entry else entry + 1.9 * abs(entry - sl)
             why = "M15 trend rõ + pullback EMA20/50 + nến xác nhận"
+            if buy_transition_ok and not trend_buy_15:
+                why = "Trend transition (H1 + EMA20 slope + break micro) + pullback + nến xác nhận"
             if sl == sl_tight:
                 why += " | tight-stop micro swing"
             build_trade("trend_pullback", "BUY", entry, sl, tp1, tp2, why, "Hủy nếu nến M5 đóng dưới đáy pullback", 8, 100, 5, 0.85 if sl == sl_tight else 1.0)
@@ -1319,6 +1346,8 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp1 = entry - abs(entry - sl)
             tp2 = max(support, entry - 1.9 * abs(entry - sl)) if support < entry else entry - 1.9 * abs(entry - sl)
             why = "M15 trend rõ + pullback EMA20/50 + nến xác nhận"
+            if sell_transition_ok and not trend_sell_15:
+                why = "Trend transition (H1 + EMA20 slope + break micro) + pullback + nến xác nhận"
             if sl == sl_tight:
                 why += " | tight-stop micro swing"
             build_trade("trend_pullback", "SELL", entry, sl, tp1, tp2, why, "Hủy nếu nến M5 đóng trên đỉnh pullback", 8, 100, 5, 0.85 if sl == sl_tight else 1.0)
@@ -1331,7 +1360,7 @@ def compute_mode2_m1_scalp_signal(cfg):
         else:
             miss = []
             if not (buy_trend_ok or sell_trend_ok):
-                miss.append("trend direction chưa đạt (EMA/M15)")
+                miss.append("trend direction chưa đạt (M15/H1+EMA20 slope+micro break)")
             if buy_trend_ok and not near_pull_buy:
                 miss.append("BUY chưa pullback về EMA/SR")
             if sell_trend_ok and not near_pull_sell:
@@ -1354,9 +1383,11 @@ def compute_mode2_m1_scalp_signal(cfg):
         r_hi = float(df["high"].iloc[i - range_n:i].max())
         r_lo = float(df["low"].iloc[i - range_n:i].min())
         r_h = max(1e-9, r_hi - r_lo)
-        breakout_body = body >= 0.42 * rng
+        body_strong = body >= 0.52 * rng
+        body_ok = body >= 0.42 * rng
         vol_mult = 0.92 if in_london_ny else 0.80
-        vol_boost = vol_now >= vol_mult * max(1.0, vol_avg)
+        vol_avg_base = max(1.0, vol_avg)
+        vol_boost = (body_strong and vol_now >= 1.00 * vol_avg_base) or (body_ok and vol_now >= vol_mult * vol_avg_base)
         # Break-and-go continuation branch for strong directional markets with shallow pullback.
         cont_sell = (
             trend_sell
@@ -1374,25 +1405,25 @@ def compute_mode2_m1_scalp_signal(cfg):
             and vol_now >= 0.88 * max(1.0, vol_avg)
             and (res_big - close) > 0.9 * a
         )
-        if trend_buy and r_h >= 1.0 * a and r_h <= 7.5 * a and close > r_hi + 0.03 * a and breakout_body and vol_boost and (res_big - close) > 1.3 * a:
+        if trend_buy and r_h >= 1.0 * a and r_h <= 7.5 * a and close > r_hi + 0.03 * a and body_ok and vol_boost and (res_big - close) > 1.3 * a:
             entry = close
             sl = r_hi - 0.20 * a
             tp1 = entry + max(r_h, abs(entry - sl))
             tp2 = min(res_big, entry + 1.8 * abs(entry - sl)) if res_big > entry else entry + 1.8 * abs(entry - sl)
             build_trade("breakout", "BUY", entry, sl, tp1, tp2, "tích lũy 5-10 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 90, 5)
-        elif trend_sell and r_h >= 1.0 * a and r_h <= 7.5 * a and close < r_lo - 0.03 * a and breakout_body and vol_boost and (close - sup_big) > 1.3 * a:
+        elif trend_sell and r_h >= 1.0 * a and r_h <= 7.5 * a and close < r_lo - 0.03 * a and body_ok and vol_boost and (close - sup_big) > 1.3 * a:
             entry = close
             sl = r_lo + 0.20 * a
             tp1 = entry - max(r_h, abs(entry - sl))
             tp2 = max(sup_big, entry - 1.8 * abs(entry - sl)) if sup_big < entry else entry - 1.8 * abs(entry - sl)
             build_trade("breakout", "SELL", entry, sl, tp1, tp2, "tích lũy 5-10 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 90, 5)
-        elif trend_buy and r_h >= 1.0 * a and close > r_hi + 0.03 * a and breakout_body and (vol_now >= 0.80 * max(1.0, vol_avg)) and (res_big - close) > 1.1 * a:
+        elif trend_buy and r_h >= 1.0 * a and close > r_hi + 0.03 * a and body_ok and (vol_now >= 0.80 * max(1.0, vol_avg)) and (res_big - close) > 1.1 * a:
             entry = close
             sl = r_hi - 0.16 * a
             tp1 = entry + abs(entry - sl)
             tp2 = min(res_big, entry + 1.35 * abs(entry - sl)) if res_big > entry else entry + 1.35 * abs(entry - sl)
             build_trade("breakout", "BUY", entry, sl, tp1, tp2, "breakout continuation volume thấp (lot giảm)", "Hủy nếu đóng lại trong range cũ", 7, 84, 4, 0.7)
-        elif trend_sell and r_h >= 1.0 * a and close < r_lo - 0.03 * a and breakout_body and (vol_now >= 0.80 * max(1.0, vol_avg)) and (close - sup_big) > 1.1 * a:
+        elif trend_sell and r_h >= 1.0 * a and close < r_lo - 0.03 * a and body_ok and (vol_now >= 0.80 * max(1.0, vol_avg)) and (close - sup_big) > 1.1 * a:
             entry = close
             sl = r_lo + 0.16 * a
             tp1 = entry - abs(entry - sl)
@@ -1441,10 +1472,10 @@ def compute_mode2_m1_scalp_signal(cfg):
                 miss.append("range quá hẹp")
             if r_h > 7.5 * a:
                 miss.append("range quá rộng")
-            if not breakout_body:
+            if not body_ok:
                 miss.append("thân nến breakout yếu")
             if not vol_boost:
-                miss.append(f"volume chưa đạt ngưỡng động ({vol_mult:.2f}x)")
+                miss.append(f"volume chưa đạt (strong-body >=1.00x hoặc normal-body >= {vol_mult:.2f}x)")
             set_wait_status("breakout", why_missing(miss, "NO TRADE | breakout chưa rõ hoặc thiếu retest/volume"), buy_h=r_hi, sell_h=r_lo)
     else:
         set_wait_status("breakout", "disabled")
