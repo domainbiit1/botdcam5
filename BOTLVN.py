@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-ordercheck-v2"
+BOT_BUILD = "2026-07-08-comment-alnum-v3"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -246,6 +246,18 @@ def account_positions_all_modes(cfg):
 
 def strategy_id_from_comment(comment, mode_id):
     c = str(comment or "")
+    if c.startswith("EGS"):
+        token = c[3:]
+        # New safest format: alnum only, e.g. EGSm2tp
+        if len(token) >= 2:
+            mshort = token[:2]
+            parsed_mode = MODE_SHORT_INV.get(mshort, None)
+            if parsed_mode != mode_id:
+                return None
+            if mode_id == MODE_SCALP_M1_2:
+                sshort = token[2:4] if len(token) >= 4 else ""
+                return MODE2_STRATEGY_SHORT_INV.get(sshort, "trend_pullback" if not sshort else None)
+            return None
     if c.startswith("EGS:"):
         parts = c.split(":")
         if len(parts) >= 2:
@@ -834,7 +846,7 @@ def open_trade(cfg, side, signal):
     strat_short = ""
     if mode_id == MODE_SCALP_M1_2 and strategy_id:
         strat_short = MODE2_STRATEGY_SHORT.get(strategy_id, "")
-    trade_comment = f"EGS:{mode_short}:{strat_short}" if strat_short else f"EGS:{mode_short}"
+    trade_comment = f"EGS{mode_short}{strat_short}" if strat_short else f"EGS{mode_short}"
     trade_comment = trade_comment[:31]
     req_base = {
         "action": mt5.TRADE_ACTION_DEAL,
