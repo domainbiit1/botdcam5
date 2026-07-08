@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-comment-alnum-v3"
+BOT_BUILD = "2026-07-08-comment-fallback-v4"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -871,23 +871,33 @@ def open_trade(cfg, side, signal):
 
     res = None
     attempts = []
+    comment_variants = [trade_comment]
+    if trade_comment:
+        comment_variants.append("")
     for fm in uniq_fill_modes:
-        req = dict(req_base)
-        req["type_filling"] = fm
-        chk = mt5.order_check(req)
-        if chk is None:
-            attempts.append(f"check fill={fm} ret=None last_error={mt5.last_error()}")
-            continue
-        chk_ret = getattr(chk, "retcode", None)
-        if chk_ret not in (0, mt5.TRADE_RETCODE_DONE):
-            attempts.append(f"check fill={fm} ret={chk_ret} comment={getattr(chk, 'comment', '')} last_error={mt5.last_error()}")
-            continue
-        res = mt5.order_send(req)
+        for cm in comment_variants:
+            req = dict(req_base)
+            req["type_filling"] = fm
+            req["comment"] = cm
+            ctag = "comment=empty" if not cm else "comment=set"
+            chk = mt5.order_check(req)
+            if chk is None:
+                attempts.append(f"check fill={fm} {ctag} ret=None last_error={mt5.last_error()}")
+                continue
+            chk_ret = getattr(chk, "retcode", None)
+            if chk_ret not in (0, mt5.TRADE_RETCODE_DONE):
+                attempts.append(
+                    f"check fill={fm} {ctag} ret={chk_ret} comment={getattr(chk, 'comment', '')} last_error={mt5.last_error()}"
+                )
+                continue
+            res = mt5.order_send(req)
+            if res is not None and getattr(res, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+                break
+            attempts.append(
+                f"send fill={fm} {ctag} ret={getattr(res, 'retcode', None)} comment={getattr(res, 'comment', '')} last_error={mt5.last_error()}"
+            )
         if res is not None and getattr(res, "retcode", None) == mt5.TRADE_RETCODE_DONE:
             break
-        attempts.append(
-            f"send fill={fm} ret={getattr(res, 'retcode', None)} comment={getattr(res, 'comment', '')} last_error={mt5.last_error()}"
-        )
 
     if res is None or getattr(res, "retcode", None) != mt5.TRADE_RETCODE_DONE:
         return False, "order_send failed | " + " | ".join(attempts[-3:])
