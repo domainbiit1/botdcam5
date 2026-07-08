@@ -391,6 +391,71 @@ def build_lvn_levels(df, bins=24, lvn_count=4):
     return sorted(float(centers[i]) for i in ranked)
 
 
+def build_volume_profile_summary(df, bins=36, value_area=0.70):
+    if df is None or len(df) < 30:
+        return None
+    low = float(df["low"].min())
+    high = float(df["high"].max())
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        return None
+    bins = max(16, int(bins))
+    edges = np.linspace(low, high, bins + 1)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    vol = np.zeros(bins, dtype=float)
+    close_v = df["close"].to_numpy(dtype=float)
+    volume = df["tick_volume"].to_numpy(dtype=float)
+    idx = np.clip(np.digitize(close_v, edges) - 1, 0, bins - 1)
+    for j, b in enumerate(idx):
+        vol[b] += max(1.0, float(volume[j]))
+    total = float(vol.sum())
+    if total <= 0:
+        return None
+    poc_i = int(np.argmax(vol))
+    poc = float(centers[poc_i])
+    target = total * float(value_area)
+    picked = {poc_i}
+    acc = float(vol[poc_i])
+    left = poc_i - 1
+    right = poc_i + 1
+    while acc < target and (left >= 0 or right < bins):
+        lvol = float(vol[left]) if left >= 0 else -1.0
+        rvol = float(vol[right]) if right < bins else -1.0
+        if rvol >= lvol:
+            if right < bins:
+                picked.add(right)
+                acc += float(vol[right])
+                right += 1
+            else:
+                picked.add(left)
+                acc += float(vol[left])
+                left -= 1
+        else:
+            if left >= 0:
+                picked.add(left)
+                acc += float(vol[left])
+                left -= 1
+            else:
+                picked.add(right)
+                acc += float(vol[right])
+                right += 1
+    sel = sorted(picked)
+    vah = float(centers[max(sel)])
+    val = float(centers[min(sel)])
+    hvn_idx = np.argsort(vol)[-max(3, bins // 8):]
+    lvn_idx = np.argsort(vol)[: max(3, bins // 8)]
+    hvn = sorted(float(centers[k]) for k in hvn_idx)
+    lvn = sorted(float(centers[k]) for k in lvn_idx)
+    return {
+        "poc": poc,
+        "vah": vah,
+        "val": val,
+        "hvn": hvn,
+        "lvn": lvn,
+        "edges": centers.tolist(),
+        "vol": vol.tolist(),
+    }
+
+
 def nearest_level(levels, px):
     if not levels:
         return None
@@ -661,7 +726,15 @@ def compute_mode2_m1_scalp_signal(cfg):
             "sell_hint": sell_h if isinstance(sell_h, (int, float)) else None,
         }
 
-    def build_trade(sid, sig_side, entry, sl, tp1, tp2, why, cancel_rule, confidence, priority):
+    def build_trade(sid, sig_side, entry, sl, tp1, tp2, why, cancel_rule, confidence, priority, confirm_count):
+        if int(confirm_count) < 4:
+            set_wait_status(
+                sid,
+                "NO TRADE | tín hiệu trung bình (<4/6 yếu tố)",
+                buy_h=entry if sig_side == "BUY" else None,
+                sell_h=entry if sig_side == "SELL" else None,
+            )
+            return
         if not all(isinstance(x, (int, float)) for x in [entry, sl, tp1, tp2]):
             set_wait_status(sid, "NO TRADE | Không có SL hợp lý")
             return
@@ -778,13 +851,13 @@ def compute_mode2_m1_scalp_signal(cfg):
             sl = min(swing_lo - 0.12 * a, float(ema50.iloc[i]) - 0.18 * a)
             tp1 = entry + abs(entry - sl)
             tp2 = min(resistance, entry + 1.9 * abs(entry - sl)) if resistance > entry else entry + 1.9 * abs(entry - sl)
-            build_trade("trend_pullback", "BUY", entry, sl, tp1, tp2, "H1/M15 trend rõ + pullback EMA20/50 + nến xác nhận", "Hủy nếu nến M5 đóng dưới đáy pullback", 8, 100)
+            build_trade("trend_pullback", "BUY", entry, sl, tp1, tp2, "H1/M15 trend rõ + pullback EMA20/50 + nến xác nhận", "Hủy nếu nến M5 đóng dưới đáy pullback", 8, 100, 5)
         elif trend_sell and close < float(ema50.iloc[i]) < float(ema200.iloc[i]) and float(ema20.iloc[i]) < float(ema50.iloc[i]) and near_pull_sell and bear_reject and rsi_now <= 55 and rsi_now < rsi_prev:
             entry = close
             sl = max(swing_hi + 0.12 * a, float(ema50.iloc[i]) + 0.18 * a)
             tp1 = entry - abs(entry - sl)
             tp2 = max(support, entry - 1.9 * abs(entry - sl)) if support < entry else entry - 1.9 * abs(entry - sl)
-            build_trade("trend_pullback", "SELL", entry, sl, tp1, tp2, "H1/M15 trend rõ + pullback EMA20/50 + nến xác nhận", "Hủy nếu nến M5 đóng trên đỉnh pullback", 8, 100)
+            build_trade("trend_pullback", "SELL", entry, sl, tp1, tp2, "H1/M15 trend rõ + pullback EMA20/50 + nến xác nhận", "Hủy nếu nến M5 đóng trên đỉnh pullback", 8, 100, 5)
         else:
             set_wait_status("trend_pullback", "NO TRADE | chưa đủ điều kiện Trend Pullback", buy_h=float(ema20.iloc[i]), sell_h=float(ema20.iloc[i]))
     else:
@@ -803,13 +876,13 @@ def compute_mode2_m1_scalp_signal(cfg):
             sl = r_hi - 0.20 * a
             tp1 = entry + max(r_h, abs(entry - sl))
             tp2 = min(res_big, entry + 1.8 * abs(entry - sl)) if res_big > entry else entry + 1.8 * abs(entry - sl)
-            build_trade("breakout", "BUY", entry, sl, tp1, tp2, "tích lũy 8-15 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 95)
+            build_trade("breakout", "BUY", entry, sl, tp1, tp2, "tích lũy 8-15 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 95, 5)
         elif trend_sell and r_h >= 1.2 * a and r_h <= 4.8 * a and close < r_lo - 0.03 * a and breakout_body and vol_boost and (close - sup_big) > 1.3 * a:
             entry = close
             sl = r_lo + 0.20 * a
             tp1 = entry - max(r_h, abs(entry - sl))
             tp2 = max(sup_big, entry - 1.8 * abs(entry - sl)) if sup_big < entry else entry - 1.8 * abs(entry - sl)
-            build_trade("breakout", "SELL", entry, sl, tp1, tp2, "tích lũy 8-15 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 95)
+            build_trade("breakout", "SELL", entry, sl, tp1, tp2, "tích lũy 8-15 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 95, 5)
         else:
             set_wait_status("breakout", "NO TRADE | breakout chưa rõ hoặc thiếu retest/volume", buy_h=r_hi, sell_h=r_lo)
     else:
@@ -823,13 +896,13 @@ def compute_mode2_m1_scalp_signal(cfg):
             sl = min(low - 0.15 * a, range_lo_20 - 0.10 * a)
             tp1 = bb_mid_now
             tp2 = min(range_hi_20, entry + 1.7 * abs(entry - sl))
-            build_trade("mean_reversion", "BUY", entry, sl, tp1, tp2, "sideway + chạm BB dưới + RSI quá bán", "Hủy nếu breakdown thật sự dưới range", 7, 80)
+            build_trade("mean_reversion", "BUY", entry, sl, tp1, tp2, "sideway + chạm BB dưới + RSI quá bán", "Hủy nếu breakdown thật sự dưới range", 7, 80, 4)
         elif sideway_ok and high >= bb_up_now and close < bb_up_now and rsi_now >= 67:
             entry = close
             sl = max(high + 0.15 * a, range_hi_20 + 0.10 * a)
             tp1 = bb_mid_now
             tp2 = max(range_lo_20, entry - 1.7 * abs(entry - sl))
-            build_trade("mean_reversion", "SELL", entry, sl, tp1, tp2, "sideway + chạm BB trên + RSI quá mua", "Hủy nếu breakout thật sự khỏi range", 7, 80)
+            build_trade("mean_reversion", "SELL", entry, sl, tp1, tp2, "sideway + chạm BB trên + RSI quá mua", "Hủy nếu breakout thật sự khỏi range", 7, 80, 4)
         else:
             set_wait_status("mean_reversion", "NO TRADE | chưa đủ điều kiện Mean Reversion", buy_h=bb_dn_now, sell_h=bb_up_now)
     else:
@@ -850,13 +923,13 @@ def compute_mode2_m1_scalp_signal(cfg):
             sl = min(low - 0.12 * a, swing_lo - 0.10 * a)
             tp1 = min(resistance, entry + 1.2 * abs(entry - sl)) if resistance > entry else entry + 1.2 * abs(entry - sl)
             tp2 = min(res_big, entry + 1.8 * abs(entry - sl)) if res_big > entry else entry + 1.8 * abs(entry - sl)
-            build_trade("reversal_pa", "BUY", entry, sl, tp1, tp2, "chạm hỗ trợ mạnh + tín hiệu đảo chiều PA", "Hủy nếu nến xác nhận kế tiếp đóng dưới đáy quét", 8, 78)
+            build_trade("reversal_pa", "BUY", entry, sl, tp1, tp2, "chạm hỗ trợ mạnh + tín hiệu đảo chiều PA", "Hủy nếu nến xác nhận kế tiếp đóng dưới đáy quét", 8, 78, 4)
         elif touch_res and (bearish_engulf or bearish_pin or evening_star):
             entry = close
             sl = max(high + 0.12 * a, swing_hi + 0.10 * a)
             tp1 = max(support, entry - 1.2 * abs(entry - sl)) if support < entry else entry - 1.2 * abs(entry - sl)
             tp2 = max(sup_big, entry - 1.8 * abs(entry - sl)) if sup_big < entry else entry - 1.8 * abs(entry - sl)
-            build_trade("reversal_pa", "SELL", entry, sl, tp1, tp2, "chạm kháng cự mạnh + tín hiệu đảo chiều PA", "Hủy nếu nến xác nhận kế tiếp đóng trên đỉnh quét", 8, 78)
+            build_trade("reversal_pa", "SELL", entry, sl, tp1, tp2, "chạm kháng cự mạnh + tín hiệu đảo chiều PA", "Hủy nếu nến xác nhận kế tiếp đóng trên đỉnh quét", 8, 78, 4)
         else:
             set_wait_status("reversal_pa", "NO TRADE | chưa có PA đảo chiều tại vùng mạnh", buy_h=sup_big, sell_h=res_big)
     else:
@@ -875,13 +948,13 @@ def compute_mode2_m1_scalp_signal(cfg):
             sl = low - 0.12 * a
             tp1 = swing_hi
             tp2 = min(resistance, entry + 2.0 * abs(entry - sl)) if resistance > entry else entry + 2.0 * abs(entry - sl)
-            build_trade("orderflow_proxy", "BUY", entry, sl, tp1, tp2, "quét đáy + CHOCH tăng + retest vùng phá cấu trúc", "Hủy nếu phá xuống dưới đáy quét", 7, 76)
+            build_trade("orderflow_proxy", "BUY", entry, sl, tp1, tp2, "quét đáy + CHOCH tăng + retest vùng phá cấu trúc", "Hủy nếu phá xuống dưới đáy quét", 7, 76, 4)
         elif choch_dn and not trend_buy:
             entry = close
             sl = high + 0.12 * a
             tp1 = swing_lo
             tp2 = max(support, entry - 2.0 * abs(entry - sl)) if support < entry else entry - 2.0 * abs(entry - sl)
-            build_trade("orderflow_proxy", "SELL", entry, sl, tp1, tp2, "quét đỉnh + CHOCH giảm + retest vùng phá cấu trúc", "Hủy nếu phá lên trên đỉnh quét", 7, 76)
+            build_trade("orderflow_proxy", "SELL", entry, sl, tp1, tp2, "quét đỉnh + CHOCH giảm + retest vùng phá cấu trúc", "Hủy nếu phá lên trên đỉnh quét", 7, 76, 4)
         else:
             set_wait_status("orderflow_proxy", "NO TRADE | chưa có CHOCH rõ + retest", buy_h=micro_hi, sell_h=micro_lo)
     else:
@@ -907,13 +980,13 @@ def compute_mode2_m1_scalp_signal(cfg):
                 sl = low - 0.12 * a
                 tp1 = asia_mid
                 tp2 = min(asia_hi, entry + 1.8 * abs(entry - sl))
-                build_trade("session_scalp", "BUY", entry, sl, tp1, tp2, "quét đáy phiên Á rồi đóng lại trong range", "Hủy nếu đóng dưới đáy quét phiên Á", 8, 90)
+                build_trade("session_scalp", "BUY", entry, sl, tp1, tp2, "quét đáy phiên Á rồi đóng lại trong range", "Hủy nếu đóng dưới đáy quét phiên Á", 8, 90, 5)
             elif sweep_asia_high:
                 entry = close
                 sl = high + 0.12 * a
                 tp1 = asia_mid
                 tp2 = max(asia_lo, entry - 1.8 * abs(entry - sl))
-                build_trade("session_scalp", "SELL", entry, sl, tp1, tp2, "quét đỉnh phiên Á rồi đóng lại trong range", "Hủy nếu đóng trên đỉnh quét phiên Á", 8, 90)
+                build_trade("session_scalp", "SELL", entry, sl, tp1, tp2, "quét đỉnh phiên Á rồi đóng lại trong range", "Hủy nếu đóng trên đỉnh quét phiên Á", 8, 90, 5)
             else:
                 set_wait_status("session_scalp", "NO TRADE | chưa có sweep range phiên Á + nến xác nhận", buy_h=asia_lo, sell_h=asia_hi)
         elif in_session:
@@ -1452,6 +1525,9 @@ def run_worker(cfg):
                         if sid:
                             candidate_map[sid] = c
                     status_map = sig.get("strategy_status", {}) if isinstance(sig.get("strategy_status", {}), dict) else {}
+                    ranked = sig.get("candidates", []) or []
+                    selected_sid = str(ranked[0].get("sid", "")) if ranked else ""
+                    selected_side = str(ranked[0].get("side", "")) if ranked else ""
 
                     active_signals = []
                     for sid in enabled_strats:
@@ -1484,13 +1560,17 @@ def run_worker(cfg):
                         srt["sell_hint"] = csell if isinstance(csell, (int, float)) else None
 
                         if s_side in ("BUY", "SELL"):
-                            if open_sides and s_side not in open_sides:
+                            if sid != selected_sid:
+                                srt["last_signal"] = "WAIT"
+                                srt["signal_reason"] = "NO TRADE | ưu tiên chiến lược khác có xác suất cao hơn"
+                                continue
+                            if open_sides and selected_side and selected_side not in open_sides:
                                 srt["last_signal"] = "WAIT"
                                 srt["signal_reason"] = f"blocked opposite: mode2 lock {','.join(sorted(open_sides))}"
                                 if sig_time > 0:
                                     srt["last_time"] = sig_time
                                 log(
-                                    f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] Block {s_side}: direction lock {','.join(sorted(open_sides))}",
+                                    f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] Block {selected_side}: direction lock {','.join(sorted(open_sides))}",
                                     "info",
                                 )
                                 continue
@@ -1528,9 +1608,7 @@ def run_worker(cfg):
                     mode_runtime[mode]["entry_hint"] = hint_text
                     if active_signals:
                         mode_runtime[mode]["last_signal"] = " | ".join(active_signals)
-                        mode_runtime[mode]["signal_reason"] = "; ".join(
-                            str((candidate_map.get(sid) or {}).get("reason", "-")) for sid in enabled_strats if sid in candidate_map
-                        )
+                        mode_runtime[mode]["signal_reason"] = str((candidate_map.get(selected_sid) or {}).get("reason", sig.get("reason", "-")))
                         last_signal = f"{mode_label}: {mode_runtime[mode]['last_signal']}"
                         signal_reason = mode_runtime[mode]["signal_reason"]
                         profile_text = mode_runtime[mode]["profile_text"]
