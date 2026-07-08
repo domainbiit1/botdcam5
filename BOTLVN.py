@@ -572,6 +572,7 @@ def compute_mode1_lvn_signal(cfg):
             "side": None,
             "reason": "NO TRADE | Không có LVN rõ",
             "m5_time": t_now,
+            "close": close,
             "atr": a,
             "lvn": close,
             "buy_price_hint": None,
@@ -591,6 +592,7 @@ def compute_mode1_lvn_signal(cfg):
             "side": None,
             "reason": "NO TRADE | Không có LVN rõ",
             "m5_time": t_now,
+            "close": close,
             "atr": a,
             "lvn": close,
             "buy_price_hint": None,
@@ -907,6 +909,7 @@ def compute_mode1_lvn_signal(cfg):
             "side": None,
             "reason": summary,
             "m5_time": t_now,
+            "close": close,
             "atr": a,
             "lvn": float(lvn_main),
             "buy_price_hint": watch_buy,
@@ -935,6 +938,7 @@ def compute_mode1_lvn_signal(cfg):
         "side": best["side"],
         "reason": best["reason"],
         "m5_time": t_now,
+        "close": close,
         "atr": a,
         "lvn": float(lvn_main),
         "buy_price_hint": best["entry"] if best["side"] == "BUY" else None,
@@ -1432,6 +1436,7 @@ def compute_mode2_m1_scalp_signal(cfg):
         "side": side,
         "reason": reason,
         "m5_time": t_now,
+        "close": close,
         "atr": a,
         "lvn": float(ema20.iloc[i]),
         "buy_price_hint": buy_hint,
@@ -1879,6 +1884,12 @@ def run_worker(cfg):
     profile_text = "Auto SL/TP: warming up"
     entry_hint = "-"
     active_mode_label = ", ".join(active_mode_labels)
+    def _fmt_px(v):
+        return f"{float(v):.2f}" if isinstance(v, (int, float)) else "-"
+
+    def _one_line(txt, limit=220):
+        s = str(txt or "-").replace("\n", " | ")
+        return s if len(s) <= limit else (s[:limit] + "…")
 
     try:
         while not _stop.is_set():
@@ -1961,6 +1972,11 @@ def run_worker(cfg):
 
                     if sig_time > 0 and sig_time != int(mode_runtime[mode]["last_time"]):
                         mode_runtime[mode]["last_time"] = sig_time
+                        log(
+                            f"[{mode_label}] {sig_side if sig_side in ('BUY','SELL') else 'WAIT'} | close={_fmt_px(sig.get('close'))} "
+                            f"| watch_sell={_fmt_px(sell_hint)} | watch_buy={_fmt_px(buy_hint)} | reason={_one_line(s_reason)}",
+                            "info",
+                        )
                         positions = my_positions(cfg, mode)
                         if len(positions) < int(cfg.get("max_positions", 1)) and sig_side in ("BUY", "SELL"):
                             if preferred_mode is not None and preferred_mode != mode:
@@ -2035,6 +2051,15 @@ def run_worker(cfg):
                             srt["entry_hint"] = "-"
                         srt["buy_hint"] = cbuy if isinstance(cbuy, (int, float)) else None
                         srt["sell_hint"] = csell if isinstance(csell, (int, float)) else None
+                        if sig_time > 0 and sig_time != int(srt.get("last_diag_time", 0)):
+                            srt["last_diag_time"] = sig_time
+                            log(
+                                f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] "
+                                f"{s_side if s_side in ('BUY','SELL') else 'WAIT'} | close={_fmt_px(sig.get('close'))} "
+                                f"| watch_sell={_fmt_px(srt.get('sell_hint'))} | watch_buy={_fmt_px(srt.get('buy_hint'))} "
+                                f"| reason={_one_line(s_reason)}",
+                                "info",
+                            )
 
                         if s_side in ("BUY", "SELL"):
                             if sid != selected_sid:
