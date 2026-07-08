@@ -635,8 +635,10 @@ def compute_mode1_lvn_signal(cfg):
     h1_state = "trend tăng" if trend_h1_up else ("trend giảm" if trend_h1_dn else "đi ngang")
     m15_state = "đồng thuận H1" if (trend_h1_up and trend_m15_up) or (trend_h1_dn and trend_m15_dn) else "ngược/không đồng thuận H1"
 
-    # v2-loose mandatory no-trade filters (avoid over-filtering).
+    # v2-loose+: split hard/soft filters to avoid over-blocking.
     no_trade = []
+    soft_no_trade = []
+    hard_no_trade = []
     twist = abs(float(ema20.iloc[i]) - float(ema50.iloc[i])) < 0.08 * a and abs(float(ema50.iloc[i]) - float(ema200.iloc[i])) < 0.12 * a
     atr_low = a < float(np.nanpercentile(atr.iloc[max(0, i - 250):i + 1], 25))
     range_hi_12 = float(df["high"].iloc[i - 12:i].max())
@@ -652,20 +654,25 @@ def compute_mode1_lvn_signal(cfg):
         abs(close - sr_res),
     ) <= 0.55 * a
     if not near_key and between_range:
-        no_trade.append("Giá đang ở giữa range")
+        soft_no_trade.append("Giá đang ở giữa range")
     if twist:
-        no_trade.append("EMA đang xoắn")
+        soft_no_trade.append("EMA đang xoắn")
     if atr_low or narrow:
-        no_trade.append("ATR quá thấp")
+        soft_no_trade.append("ATR quá thấp")
     if (prev_high - prev_low) > 2.8 * a and abs(close - prev_close) > 0.8 * a:
-        no_trade.append("Giá vừa spike mạnh")
+        soft_no_trade.append("Giá vừa spike mạnh")
     if in_news_blackout(cfg, t_now):
-        no_trade.append("Gần tin mạnh")
+        hard_no_trade.append("Gần tin mạnh")
     tick = mt5.symbol_info_tick(cfg["symbol"])
     if tick is not None:
         spread = abs(float(getattr(tick, "ask", 0.0)) - float(getattr(tick, "bid", 0.0)))
-        if spread > 0.3 * a:
-            no_trade.append("Spread quá cao")
+        if spread > 0.45 * a:
+            hard_no_trade.append("Spread quá cao")
+        elif spread > 0.35 * a:
+            soft_no_trade.append("Spread cao hơn 35% ATR M5")
+
+    if hard_no_trade or len(soft_no_trade) >= 3:
+        no_trade = list(hard_no_trade) + list(soft_no_trade)
 
     # Session preference (VN): London 14:00-17:00, NY 19:30-23:00.
     minute_utc = datetime.utcfromtimestamp(t_now).hour * 60 + datetime.utcfromtimestamp(t_now).minute
@@ -1103,9 +1110,7 @@ def compute_mode2_m1_scalp_signal(cfg):
         if rr < float(MODE2_RR_MIN):
             set_wait_status(sid, "NO TRADE | Không đủ RR (<1:1.2)", buy_h=entry if sig_side == "BUY" else None, sell_h=entry if sig_side == "SELL" else None)
             return
-        if abs(float(entry) - range_mid_60) <= 0.15 * max(1e-9, range_w_40):
-            set_wait_status(sid, "NO TRADE | Entry nằm giữa range", buy_h=entry if sig_side == "BUY" else None, sell_h=entry if sig_side == "SELL" else None)
-            return
+        # v2-loose+: do not hard-block all setups just because entry is near range midpoint.
         trade_reason = (
             f"Chiến lược: {MODE2_STRATEGY_LABELS.get(sid, sid)} | Hướng: {sig_side} | Entry:{entry:.2f} "
             f"SL:{sl:.2f} TP1:{tp1:.2f} TP2:{tp2:.2f} RR:{rr:.2f} | Lý do: {why} | Hủy kèo: {cancel_rule} "
@@ -1162,13 +1167,13 @@ def compute_mode2_m1_scalp_signal(cfg):
     tick = mt5.symbol_info_tick(cfg["symbol"])
     if tick is not None:
         spread = abs(float(getattr(tick, "ask", 0.0)) - float(getattr(tick, "bid", 0.0)))
-        if spread > 0.35 * a:
+        if spread > 0.45 * a:
             hard_noise.append("Spread quá cao")
-        elif spread > 0.30 * a:
-            soft_noise.append("Spread cao hơn 30% ATR M5")
+        elif spread > 0.35 * a:
+            soft_noise.append("Spread cao hơn 35% ATR M5")
 
-    # v2-loose: keep mandatory hard blocks, but allow up to one soft warning.
-    if hard_noise or len(soft_noise) >= 2:
+    # v2-loose+: keep hard blocks, but only stop when soft warnings stack up.
+    if hard_noise or len(soft_noise) >= 3:
         no_trade_reasons = list(hard_noise) + list(soft_noise)
         base_reason = "NO TRADE | " + " ; ".join(no_trade_reasons[:3])
         for sid in MODE2_STRATEGY_LABELS:
@@ -1267,7 +1272,7 @@ def compute_mode2_m1_scalp_signal(cfg):
 
     # 3) Mean Reversion
     if strat_on("mean_reversion"):
-        sideway_ok = range_w_40 >= 2.0 * a and range_w_40 <= 7.0 * a and trend_strength < 0.65 and not trend_buy and not trend_sell
+        sideway_ok = range_w_40 >= 1.4 * a and range_w_40 <= 8.0 * a and trend_strength < 0.75 and not trend_buy and not trend_sell
         if sideway_ok and low <= bb_dn_now and close > bb_dn_now and rsi_now <= 33:
             entry = close
             sl = min(low - 0.15 * a, range_lo_20 - 0.10 * a)
