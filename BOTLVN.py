@@ -1036,8 +1036,9 @@ def compute_mode2_m1_scalp_signal(cfg):
     trend_sell_15 = float(d15["close"].iloc[-1]) < float(e50_15.iloc[-1]) < float(e200_15.iloc[-1]) and float(e20_15.iloc[-1]) < float(e50_15.iloc[-1])
     trend_buy_h1 = float(dh1["close"].iloc[-1]) > float(e50_h1.iloc[-1]) > float(e200_h1.iloc[-1]) and float(e20_h1.iloc[-1]) > float(e50_h1.iloc[-1])
     trend_sell_h1 = float(dh1["close"].iloc[-1]) < float(e50_h1.iloc[-1]) < float(e200_h1.iloc[-1]) and float(e20_h1.iloc[-1]) < float(e50_h1.iloc[-1])
-    trend_buy = trend_buy_15 and trend_buy_h1
-    trend_sell = trend_sell_15 and trend_sell_h1
+    # Relaxed trend gate: prioritize M15, only block when H1 is strongly opposite.
+    trend_buy = trend_buy_15 and not trend_sell_h1
+    trend_sell = trend_sell_15 and not trend_buy_h1
     trend_flat = not trend_buy and not trend_sell
 
     mode2_cfg = cfg.get("modes", {}).get(MODE_SCALP_M1_2, {})
@@ -1129,8 +1130,11 @@ def compute_mode2_m1_scalp_signal(cfg):
             "sell_hint": float(entry) if sig_side == "SELL" else None,
         }
 
-    # Mandatory anti-noise filters.
+    # Mandatory anti-noise filters (relaxed in peak sessions).
     no_trade_reasons = []
+    soft_noise = []
+    hard_noise = []
+    in_london_ny = (7 * 60 <= minute_utc <= 10 * 60) or (12 * 60 + 30 <= minute_utc <= 16 * 60)
     ema_twisted = abs(float(ema20.iloc[i]) - float(ema50.iloc[i])) < 0.08 * a and abs(float(ema50.iloc[i]) - float(ema200.iloc[i])) < 0.12 * a
     rsi_neutral = 45.0 <= rsi_now <= 55.0 and abs(rsi_now - rsi_prev) < 1.5
     atr_low = a < float(np.nanpercentile(atr.iloc[max(0, i - 250):i + 1], 25))
@@ -1138,24 +1142,28 @@ def compute_mode2_m1_scalp_signal(cfg):
     # Only block post-spike if market stalls after extreme candle.
     spike_prev = (prev_high - prev_low) > 2.8 * a and abs(close - prev_close) < 0.25 * a
     if narrow_sideway:
-        no_trade_reasons.append("Thị trường đang nhiễu")
+        soft_noise.append("Thị trường đang nhiễu")
     if ema_twisted:
-        no_trade_reasons.append("EMA đang xoắn")
+        soft_noise.append("EMA đang xoắn")
     if rsi_neutral:
-        no_trade_reasons.append("RSI 45-55, thiếu động lượng")
+        soft_noise.append("RSI 45-55, thiếu động lượng")
     if atr_low:
-        no_trade_reasons.append("ATR thấp, thiếu biên độ")
+        soft_noise.append("ATR thấp, thiếu biên độ")
     if spike_prev:
-        no_trade_reasons.append("Vừa có nến spike lớn chưa retest")
+        soft_noise.append("Vừa có nến spike lớn chưa retest")
     if in_news_blackout(cfg, t_now):
-        no_trade_reasons.append("Gần tin mạnh")
+        hard_noise.append("Gần tin mạnh")
     tick = mt5.symbol_info_tick(cfg["symbol"])
     if tick is not None:
         spread = abs(float(getattr(tick, "ask", 0.0)) - float(getattr(tick, "bid", 0.0)))
-        if spread > 0.3 * a:
-            no_trade_reasons.append("Spread cao hơn 30% ATR M5")
+        if spread > 0.35 * a:
+            hard_noise.append("Spread quá cao")
+        elif spread > 0.30 * a:
+            soft_noise.append("Spread cao hơn 30% ATR M5")
 
-    if no_trade_reasons:
+    # In London/NY, allow one soft warning; outside sessions keep stricter block.
+    if hard_noise or (in_london_ny and len(soft_noise) >= 2) or ((not in_london_ny) and len(soft_noise) >= 1):
+        no_trade_reasons = list(hard_noise) + list(soft_noise)
         base_reason = "NO TRADE | " + " ; ".join(no_trade_reasons[:3])
         for sid in MODE2_STRATEGY_LABELS:
             if strat_on(sid):
