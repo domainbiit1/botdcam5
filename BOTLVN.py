@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-entry-recovery-v9"
+BOT_BUILD = "2026-07-08-mode2-all6-v10"
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -134,6 +134,7 @@ MODE2_SETUP_LOCK_MINUTES = 45
 
 _today_mode_cache = {}
 _setup_lock_cache = {}
+_closed_deal_log_cache = {}
 
 
 def send(obj):
@@ -1278,10 +1279,16 @@ def compute_mode2_m1_scalp_signal(cfg):
         fast_sell = trend_sell and close < float(ema20.iloc[i]) and body >= 0.58 * rng and vol_now >= 1.05 * max(1.0, vol_avg) and rsi_now <= 53
         if trend_buy and close > float(ema50.iloc[i]) > float(ema200.iloc[i]) and float(ema20.iloc[i]) > float(ema50.iloc[i]) and near_pull_buy and bull_confirm and rsi_now >= 44 and rsi_now >= rsi_prev - 0.8:
             entry = close
-            sl = min(swing_lo - 0.12 * a, float(ema50.iloc[i]) - 0.18 * a)
+            micro_lo = float(df["low"].iloc[i - 6:i].min())
+            sl_std = min(swing_lo - 0.12 * a, float(ema50.iloc[i]) - 0.18 * a)
+            sl_tight = min(micro_lo - 0.08 * a, float(ema20.iloc[i]) - 0.12 * a)
+            sl = sl_std if abs(entry - sl_std) <= float(MODE2_SL_MAX) else sl_tight
             tp1 = entry + abs(entry - sl)
             tp2 = min(resistance, entry + 1.9 * abs(entry - sl)) if resistance > entry else entry + 1.9 * abs(entry - sl)
-            build_trade("trend_pullback", "BUY", entry, sl, tp1, tp2, "M15 trend rõ + pullback EMA20/50 + nến xác nhận", "Hủy nếu nến M5 đóng dưới đáy pullback", 8, 100, 5)
+            why = "M15 trend rõ + pullback EMA20/50 + nến xác nhận"
+            if sl == sl_tight:
+                why += " | tight-stop micro swing"
+            build_trade("trend_pullback", "BUY", entry, sl, tp1, tp2, why, "Hủy nếu nến M5 đóng dưới đáy pullback", 8, 100, 5, 0.85 if sl == sl_tight else 1.0)
         elif in_london_ny and fast_buy:
             entry = close
             sl = min(swing_lo - 0.10 * a, float(ema20.iloc[i]) - 0.15 * a)
@@ -1290,10 +1297,16 @@ def compute_mode2_m1_scalp_signal(cfg):
             build_trade("trend_pullback", "BUY", entry, sl, tp1, tp2, "momentum buy continuation từ vùng EMA20", "Hủy nếu nến M5 đóng lại dưới EMA20", 7, 98, 4, 0.7)
         elif trend_sell and close < float(ema50.iloc[i]) < float(ema200.iloc[i]) and float(ema20.iloc[i]) < float(ema50.iloc[i]) and near_pull_sell and bear_confirm and rsi_now <= 56 and rsi_now <= rsi_prev + 0.8:
             entry = close
-            sl = max(swing_hi + 0.12 * a, float(ema50.iloc[i]) + 0.18 * a)
+            micro_hi = float(df["high"].iloc[i - 6:i].max())
+            sl_std = max(swing_hi + 0.12 * a, float(ema50.iloc[i]) + 0.18 * a)
+            sl_tight = max(micro_hi + 0.08 * a, float(ema20.iloc[i]) + 0.12 * a)
+            sl = sl_std if abs(entry - sl_std) <= float(MODE2_SL_MAX) else sl_tight
             tp1 = entry - abs(entry - sl)
             tp2 = max(support, entry - 1.9 * abs(entry - sl)) if support < entry else entry - 1.9 * abs(entry - sl)
-            build_trade("trend_pullback", "SELL", entry, sl, tp1, tp2, "M15 trend rõ + pullback EMA20/50 + nến xác nhận", "Hủy nếu nến M5 đóng trên đỉnh pullback", 8, 100, 5)
+            why = "M15 trend rõ + pullback EMA20/50 + nến xác nhận"
+            if sl == sl_tight:
+                why += " | tight-stop micro swing"
+            build_trade("trend_pullback", "SELL", entry, sl, tp1, tp2, why, "Hủy nếu nến M5 đóng trên đỉnh pullback", 8, 100, 5, 0.85 if sl == sl_tight else 1.0)
         elif in_london_ny and fast_sell:
             entry = close
             sl = max(swing_hi + 0.10 * a, float(ema20.iloc[i]) + 0.15 * a)
@@ -1336,6 +1349,18 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp1 = entry - max(r_h, abs(entry - sl))
             tp2 = max(sup_big, entry - 1.8 * abs(entry - sl)) if sup_big < entry else entry - 1.8 * abs(entry - sl)
             build_trade("breakout", "SELL", entry, sl, tp1, tp2, "tích lũy 5-10 nến + breakout thân mạnh + volume tăng", "Hủy nếu giá đóng lại vào trong range", 8, 90, 5)
+        elif trend_buy and prev_close > r_hi and close > r_hi and close >= prev_close - 0.15 * a and body >= 0.36 * rng:
+            entry = close
+            sl = min(low, r_hi) - 0.16 * a
+            tp1 = entry + abs(entry - sl)
+            tp2 = min(res_big, entry + 1.45 * abs(entry - sl)) if res_big > entry else entry + 1.45 * abs(entry - sl)
+            build_trade("breakout", "BUY", entry, sl, tp1, tp2, "follow-through breakout sau nến phá đầu tiên", "Hủy nếu nến M5 đóng lại trong range cũ", 7, 88, 4, 0.85)
+        elif trend_sell and prev_close < r_lo and close < r_lo and close <= prev_close + 0.15 * a and body >= 0.36 * rng:
+            entry = close
+            sl = max(high, r_lo) + 0.16 * a
+            tp1 = entry - abs(entry - sl)
+            tp2 = max(sup_big, entry - 1.45 * abs(entry - sl)) if sup_big < entry else entry - 1.45 * abs(entry - sl)
+            build_trade("breakout", "SELL", entry, sl, tp1, tp2, "follow-through breakdown sau nến phá đầu tiên", "Hủy nếu nến M5 đóng lại trong range cũ", 7, 88, 4, 0.85)
         # Impulse continuation fallback: allow strong directional break without perfect retest.
         elif trend_sell and close < r_lo - 0.25 * a and body >= 0.75 * rng and vol_now >= 1.25 * max(1.0, vol_avg) and (close - sup_big) > 1.8 * a:
             entry = close
@@ -1365,14 +1390,15 @@ def compute_mode2_m1_scalp_signal(cfg):
 
     # 3) Mean Reversion
     if strat_on("mean_reversion"):
-        sideway_ok = range_w_40 >= 1.4 * a and range_w_40 <= 8.0 * a and trend_strength < 0.75 and not trend_buy and not trend_sell
-        if sideway_ok and low <= bb_dn_now and close > bb_dn_now and rsi_now <= 33:
+        sideway_ok = range_w_40 >= 1.2 * a and range_w_40 <= 8.5 * a and trend_strength < 0.85 and not (trend_buy and close > float(ema20.iloc[i]) + 0.2 * a) and not (trend_sell and close < float(ema20.iloc[i]) - 0.2 * a)
+        breakout_risk = body >= 0.80 * rng and (close > range_hi_20 + 0.12 * a or close < range_lo_20 - 0.12 * a)
+        if sideway_ok and (not breakout_risk) and low <= bb_dn_now and close > bb_dn_now and rsi_now <= 38:
             entry = close
             sl = min(low - 0.15 * a, range_lo_20 - 0.10 * a)
             tp1 = bb_mid_now
             tp2 = min(range_hi_20, entry + 1.7 * abs(entry - sl))
             build_trade("mean_reversion", "BUY", entry, sl, tp1, tp2, "sideway + chạm BB dưới + RSI quá bán", "Hủy nếu breakdown thật sự dưới range", 7, 70, 5)
-        elif sideway_ok and high >= bb_up_now and close < bb_up_now and rsi_now >= 67:
+        elif sideway_ok and (not breakout_risk) and high >= bb_up_now and close < bb_up_now and rsi_now >= 62:
             entry = close
             sl = max(high + 0.15 * a, range_hi_20 + 0.10 * a)
             tp1 = bb_mid_now
@@ -1382,6 +1408,8 @@ def compute_mode2_m1_scalp_signal(cfg):
             miss = []
             if not sideway_ok:
                 miss.append("thị trường chưa đủ sideway")
+            if breakout_risk:
+                miss.append("nguy cơ breakout mạnh khỏi range")
             if not (low <= bb_dn_now or high >= bb_up_now):
                 miss.append("chưa chạm biên Bollinger")
             if not (rsi_now <= 40 or rsi_now >= 60):
@@ -1398,15 +1426,17 @@ def compute_mode2_m1_scalp_signal(cfg):
         bearish_pin = (high - max(open_, close)) >= 0.5 * rng and close < open_
         morning_star = (float(prev2["close"]) < float(prev2["open"])) and (abs(prev_close - prev_open) < 0.4 * a) and close > open_
         evening_star = (float(prev2["close"]) > float(prev2["open"])) and (abs(prev_close - prev_open) < 0.4 * a) and close < open_
+        bull_follow2 = (prev_close > prev_open) and (close > prev_close) and close > open_
+        bear_follow2 = (prev_close < prev_open) and (close < prev_close) and close < open_
         touch_sup = abs(low - sup_big) <= 0.40 * a or abs(low - support) <= 0.40 * a
         touch_res = abs(high - res_big) <= 0.40 * a or abs(high - resistance) <= 0.40 * a
-        if touch_sup and (bullish_engulf or bullish_pin or morning_star):
+        if touch_sup and (bullish_engulf or bullish_pin or morning_star or bull_follow2):
             entry = close
             sl = min(low - 0.12 * a, swing_lo - 0.10 * a)
             tp1 = min(resistance, entry + 1.2 * abs(entry - sl)) if resistance > entry else entry + 1.2 * abs(entry - sl)
             tp2 = min(res_big, entry + 1.8 * abs(entry - sl)) if res_big > entry else entry + 1.8 * abs(entry - sl)
             build_trade("reversal_pa", "BUY", entry, sl, tp1, tp2, "chạm hỗ trợ mạnh + tín hiệu đảo chiều PA", "Hủy nếu nến xác nhận kế tiếp đóng dưới đáy quét", 8, 110, 5)
-        elif touch_res and (bearish_engulf or bearish_pin or evening_star):
+        elif touch_res and (bearish_engulf or bearish_pin or evening_star or bear_follow2):
             entry = close
             sl = max(high + 0.12 * a, swing_hi + 0.10 * a)
             tp1 = max(support, entry - 1.2 * abs(entry - sl)) if support < entry else entry - 1.2 * abs(entry - sl)
@@ -1416,7 +1446,7 @@ def compute_mode2_m1_scalp_signal(cfg):
             miss = []
             if not (touch_sup or touch_res):
                 miss.append("chưa chạm vùng S/R mạnh")
-            if not (bullish_engulf or bearish_engulf or bullish_pin or bearish_pin or morning_star or evening_star):
+            if not (bullish_engulf or bearish_engulf or bullish_pin or bearish_pin or morning_star or evening_star or bull_follow2 or bear_follow2):
                 miss.append("chưa có mẫu nến đảo chiều")
             set_wait_status("reversal_pa", why_missing(miss, "NO TRADE | chưa có PA đảo chiều tại vùng mạnh"), buy_h=sup_big, sell_h=res_big)
     else:
@@ -1426,10 +1456,14 @@ def compute_mode2_m1_scalp_signal(cfg):
     if strat_on("orderflow_proxy"):
         micro_hi = float(df["high"].iloc[i - 6:i - 1].max())
         micro_lo = float(df["low"].iloc[i - 6:i - 1].min())
-        sweep_low = low < swing_lo - 0.03 * a and close > swing_lo
-        sweep_high = high > swing_hi + 0.03 * a and close < swing_hi
-        choch_up = sweep_low and close > micro_hi and prev_close <= micro_hi
-        choch_dn = sweep_high and close < micro_lo and prev_close >= micro_lo
+        sweep_low = low < swing_lo - 0.02 * a and close > swing_lo
+        sweep_high = high > swing_hi + 0.02 * a and close < swing_hi
+        choch_up = (sweep_low and close > micro_hi - 0.03 * a and prev_close <= micro_hi + 0.03 * a) or (
+            close > micro_hi + 0.06 * a and prev_close <= micro_hi and low <= micro_lo + 0.20 * a
+        )
+        choch_dn = (sweep_high and close < micro_lo + 0.03 * a and prev_close >= micro_lo - 0.03 * a) or (
+            close < micro_lo - 0.06 * a and prev_close >= micro_lo and high >= micro_hi - 0.20 * a
+        )
         if choch_up and not trend_sell:
             entry = close
             sl = low - 0.12 * a
@@ -1469,6 +1503,11 @@ def compute_mode2_m1_scalp_signal(cfg):
             asia_mid = (asia_hi + asia_lo) / 2.0
             sweep_asia_low = low < asia_lo and close > asia_lo and (min(open_, close) - low) > 0.35 * rng
             sweep_asia_high = high > asia_hi and close < asia_hi and (high - max(open_, close)) > 0.35 * rng
+            recent_hi = float(df["high"].iloc[i - 36:i].max())
+            recent_lo = float(df["low"].iloc[i - 36:i].min())
+            recent_mid = (recent_hi + recent_lo) / 2.0
+            sweep_recent_low = low < recent_lo and close > recent_lo and (min(open_, close) - low) > 0.30 * rng
+            sweep_recent_high = high > recent_hi and close < recent_hi and (high - max(open_, close)) > 0.30 * rng
             if sweep_asia_low:
                 entry = close
                 sl = low - 0.12 * a
@@ -1481,6 +1520,18 @@ def compute_mode2_m1_scalp_signal(cfg):
                 tp1 = asia_mid
                 tp2 = max(asia_lo, entry - 1.8 * abs(entry - sl))
                 build_trade("session_scalp", "SELL", entry, sl, tp1, tp2, "quét đỉnh phiên Á rồi đóng lại trong range", "Hủy nếu đóng trên đỉnh quét phiên Á", 8, 120, 5)
+            elif sweep_recent_low:
+                entry = close
+                sl = low - 0.10 * a
+                tp1 = recent_mid
+                tp2 = min(recent_hi, entry + 1.5 * abs(entry - sl))
+                build_trade("session_scalp", "BUY", entry, sl, tp1, tp2, "quét đáy range gần nhất trong phiên thanh khoản", "Hủy nếu đóng dưới đáy quét range gần", 7, 116, 4, 0.85)
+            elif sweep_recent_high:
+                entry = close
+                sl = high + 0.10 * a
+                tp1 = recent_mid
+                tp2 = max(recent_lo, entry - 1.5 * abs(entry - sl))
+                build_trade("session_scalp", "SELL", entry, sl, tp1, tp2, "quét đỉnh range gần nhất trong phiên thanh khoản", "Hủy nếu đóng trên đỉnh quét range gần", 7, 116, 4, 0.85)
             else:
                 set_wait_status("session_scalp", "NO TRADE | chưa có sweep range phiên Á + nến xác nhận", buy_h=asia_lo, sell_h=asia_hi)
         elif in_session:
@@ -1595,6 +1646,93 @@ def get_today_mode_stats(cfg, mode):
         return out
     except Exception:
         return empty
+
+
+def _deal_reason_text(reason_code):
+    code = int(reason_code)
+    mapping = {
+        int(getattr(mt5, "DEAL_REASON_SL", -10001)): "SL",
+        int(getattr(mt5, "DEAL_REASON_TP", -10002)): "TP",
+        int(getattr(mt5, "DEAL_REASON_SO", -10003)): "STOP_OUT",
+        int(getattr(mt5, "DEAL_REASON_EXPERT", -10004)): "EXPERT",
+        int(getattr(mt5, "DEAL_REASON_CLIENT", -10005)): "MANUAL",
+        int(getattr(mt5, "DEAL_REASON_MOBILE", -10006)): "MOBILE",
+        int(getattr(mt5, "DEAL_REASON_WEB", -10007)): "WEB",
+    }
+    return mapping.get(code, f"reason#{code}")
+
+
+def log_recent_closed_deals(cfg, lookback_hours=24):
+    """Emit detailed close diagnostics for win/loss debug."""
+    try:
+        start = datetime.now() - timedelta(hours=max(1, int(lookback_hours)))
+        deals = mt5.history_deals_get(start, datetime.now())
+        if deals is None:
+            return
+        mode_magic_map = {int(mode_magic(cfg, m)): m for m in MODE_LABELS}
+        in_by_pos = {}
+        for d in deals:
+            magic = int(getattr(d, "magic", 0) or 0)
+            if magic not in mode_magic_map:
+                continue
+            if int(getattr(d, "entry", -1)) != int(mt5.DEAL_ENTRY_IN):
+                continue
+            pos_id = int(getattr(d, "position_id", 0) or 0)
+            if pos_id <= 0:
+                continue
+            d_type = int(getattr(d, "type", -1))
+            side = "BUY" if d_type == int(getattr(mt5, "DEAL_TYPE_BUY", -999)) else ("SELL" if d_type == int(getattr(mt5, "DEAL_TYPE_SELL", -998)) else "UNK")
+            in_by_pos[pos_id] = {
+                "entry": float(getattr(d, "price", 0.0) or 0.0),
+                "side": side,
+            }
+
+        now = time.time()
+        for d in deals:
+            magic = int(getattr(d, "magic", 0) or 0)
+            mode_id = mode_magic_map.get(magic)
+            if mode_id is None:
+                continue
+            if int(getattr(d, "entry", -1)) != int(mt5.DEAL_ENTRY_OUT):
+                continue
+            ticket = int(getattr(d, "ticket", 0) or 0)
+            if ticket <= 0 or ticket in _closed_deal_log_cache:
+                continue
+            pos_id = int(getattr(d, "position_id", 0) or 0)
+            in_leg = in_by_pos.get(pos_id, {})
+            entry_price = in_leg.get("entry")
+            side = in_leg.get("side", "UNK")
+            exit_price = float(getattr(d, "price", 0.0) or 0.0)
+            pnl = float(getattr(d, "profit", 0.0) or 0.0) + float(getattr(d, "swap", 0.0) or 0.0) + float(getattr(d, "commission", 0.0) or 0.0)
+            outcome = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BE")
+            if isinstance(entry_price, (int, float)) and side in ("BUY", "SELL"):
+                move = (exit_price - float(entry_price)) if side == "BUY" else (float(entry_price) - exit_price)
+                move_txt = f"{move:+.2f}"
+                entry_txt = f"{float(entry_price):.2f}"
+            else:
+                move_txt = "-"
+                entry_txt = "-"
+            comment = str(getattr(d, "comment", "") or "")
+            sid = strategy_id_from_comment(comment, mode_id)
+            if mode_id == MODE_SCALP_M1_2:
+                strat_label = MODE2_STRATEGY_LABELS.get(sid or "", sid or "-")
+            else:
+                strat_label = str(sid or "Mode1")
+            reason_txt = _deal_reason_text(getattr(d, "reason", -1))
+            log(
+                f"[CLOSE][{MODE_LABELS.get(mode_id, mode_id)}/{strat_label}] {outcome} {side} "
+                f"entry={entry_txt} exit={exit_price:.2f} move={move_txt} pnl={pnl:+.2f} "
+                f"close_reason={reason_txt} comment={comment or '-'}",
+                "info",
+            )
+            _closed_deal_log_cache[ticket] = now
+        # prune old cache entries
+        if len(_closed_deal_log_cache) > 3000:
+            stale = sorted(_closed_deal_log_cache.items(), key=lambda kv: kv[1])[:1000]
+            for tk, _ in stale:
+                _closed_deal_log_cache.pop(tk, None)
+    except Exception as exc:
+        log(f"[CLOSE] diagnostics failed: {exc}", "warn")
 
 
 def lot_from_risk(cfg, stop_distance):
@@ -1976,6 +2114,7 @@ def run_worker(cfg):
     entry_hint = "-"
     active_mode_label = ", ".join(active_mode_labels)
     last_heartbeat_t = 0.0
+    last_deal_diag_t = 0.0
     def _fmt_px(v):
         return f"{float(v):.2f}" if isinstance(v, (int, float)) else "-"
 
@@ -2007,6 +2146,9 @@ def run_worker(cfg):
                     "info",
                 )
                 last_heartbeat_t = now
+            if now - last_deal_diag_t >= 15.0:
+                log_recent_closed_deals(cfg, lookback_hours=24)
+                last_deal_diag_t = now
             cycle_signals = {}
             if MODE_LVN_1 in enabled_modes:
                 sig1 = compute_mode1_lvn_signal(cfg)
