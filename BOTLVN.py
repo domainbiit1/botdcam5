@@ -636,8 +636,8 @@ def compute_mode1_lvn_signal(cfg):
             "lvn": float(lvn_main),
             "buy_price_hint": watch_buy,
             "sell_price_hint": watch_sell,
-            "atr_rank": atr_rank,
-            "trend_strength": trend_strength,
+            "atr_rank": 0.5,
+            "trend_strength": 0.0,
             "strategy_id": "no-trade",
         }
 
