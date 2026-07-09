@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-09-mode2-debug-logs-v22"
+BOT_BUILD = "2026-07-09-mode2-session-tuning-v23"
 MODE2_MEAN_REV_LOCK_MINUTES = 90
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
@@ -414,8 +414,8 @@ def manage_mode2_break_even(cfg):
             if entry <= 0 or sl_cur <= 0:
                 continue
 
-            st = _mode2_be_cache.get(ticket, {})
-            def log_once(diag_key, message, level="info", cooldown=45.0):
+            st = _mode2_be_cache.setdefault(ticket, {})
+            def log_once(diag_key, message, level="info", cooldown=120.0):
                 last_key = str(st.get("last_diag_key", ""))
                 last_t = float(st.get("last_diag_t", 0.0) or 0.0)
                 if last_key == str(diag_key) and (now_ts - last_t) < float(cooldown):
@@ -433,14 +433,10 @@ def manage_mode2_break_even(cfg):
             tp1_done = bool(st.get("tp1_done", False))
             if tp1 <= 0:
                 tp1 = entry + init_risk if side == "BUY" else entry - init_risk
-            _mode2_be_cache[ticket] = {
-                "init_risk": init_risk,
-                "stage": st_stage,
-                "tp1": tp1,
-                "tp1_done": tp1_done,
-                "last_diag_key": st.get("last_diag_key", ""),
-                "last_diag_t": float(st.get("last_diag_t", 0.0) or 0.0),
-            }
+            st["init_risk"] = init_risk
+            st["stage"] = st_stage
+            st["tp1"] = tp1
+            st["tp1_done"] = tp1_done
 
             move = (bid - entry) if side == "BUY" else (entry - ask)
             if move <= 0:
@@ -479,14 +475,9 @@ def manage_mode2_break_even(cfg):
                                 break
                         if sent:
                             tp1_done = True
-                            _mode2_be_cache[ticket] = {
-                                "init_risk": init_risk,
-                                "stage": st_stage,
-                                "tp1": tp1,
-                                "tp1_done": True,
-                                "last_diag_key": "",
-                                "last_diag_t": 0.0,
-                            }
+                            st["tp1_done"] = True
+                            st["last_diag_key"] = ""
+                            st["last_diag_t"] = 0.0
                             log(
                                 f"[Mode 2 - TP1/{MODE2_STRATEGY_LABELS.get(sid, sid)}] ticket={ticket} {side} "
                                 f"close50%={close_vol:.2f}/{vol:.2f} @tp1={tp1:.2f}",
@@ -533,7 +524,7 @@ def manage_mode2_break_even(cfg):
                 new_sl = min(new_sl, max_allowed)
                 if new_sl <= sl_cur + point * 0.5:
                     log_once(
-                        f"{target_stage}-skip-tight",
+                        f"{target_stage}-skip-tight-{side}",
                         f"[Mode 2 - {target_stage.upper()}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] "
                         f"ticket={ticket} skip SL move: broker distance/tight spread",
                         "info",
@@ -544,7 +535,7 @@ def manage_mode2_break_even(cfg):
                 new_sl = max(new_sl, min_allowed)
                 if new_sl >= sl_cur - point * 0.5:
                     log_once(
-                        f"{target_stage}-skip-tight",
+                        f"{target_stage}-skip-tight-{side}",
                         f"[Mode 2 - {target_stage.upper()}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] "
                         f"ticket={ticket} skip SL move: broker distance/tight spread",
                         "info",
@@ -571,14 +562,11 @@ def manage_mode2_break_even(cfg):
                 )
                 continue
 
-            _mode2_be_cache[ticket] = {
-                "init_risk": init_risk,
-                "stage": target_stage,
-                "tp1": tp1,
-                "tp1_done": tp1_done,
-                "last_diag_key": "",
-                "last_diag_t": 0.0,
-            }
+            st["stage"] = target_stage
+            st["tp1"] = tp1
+            st["tp1_done"] = tp1_done
+            st["last_diag_key"] = ""
+            st["last_diag_t"] = 0.0
             log(
                 f"[Mode 2 - {target_stage.upper()}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] "
                 f"ticket={ticket} {side} vol={vol:.2f} move={move:.2f} ({move_r:.2f}R) "
@@ -1872,6 +1860,20 @@ def compute_mode2_m1_scalp_signal(cfg):
             asia_hi = float(df.loc[asia_mask, "high"].max())
             asia_lo = float(df.loc[asia_mask, "low"].min())
             asia_mid = (asia_hi + asia_lo) / 2.0
+            session_up_impulse = (
+                close > float(ema20.iloc[i]) > float(ema50.iloc[i])
+                and close > float(ema200.iloc[i])
+                and close > range_hi_20 + 0.08 * a
+                and rsi_now >= 60
+                and body >= 0.55 * rng
+            )
+            session_dn_impulse = (
+                close < float(ema20.iloc[i]) < float(ema50.iloc[i])
+                and close < float(ema200.iloc[i])
+                and close < range_lo_20 - 0.08 * a
+                and rsi_now <= 40
+                and body >= 0.55 * rng
+            )
             sweep_asia_low = low < asia_lo and close > asia_lo and (min(open_, close) - low) > 0.35 * rng
             sweep_asia_high = high > asia_hi and close < asia_hi and (high - max(open_, close)) > 0.35 * rng
             recent_hi = float(df["high"].iloc[i - 36:i].max())
@@ -1879,32 +1881,46 @@ def compute_mode2_m1_scalp_signal(cfg):
             recent_mid = (recent_hi + recent_lo) / 2.0
             sweep_recent_low = low < recent_lo and close > recent_lo and (min(open_, close) - low) > 0.30 * rng
             sweep_recent_high = high > recent_hi and close < recent_hi and (high - max(open_, close)) > 0.30 * rng
-            if sweep_asia_low:
+            if sweep_asia_low and not session_dn_impulse:
                 entry = close
                 sl = low - 0.12 * a
-                tp1 = asia_mid
-                tp2 = min(asia_hi, entry + 1.8 * abs(entry - sl))
+                stop = abs(entry - sl)
+                tp1 = min(float(asia_mid), entry + 1.30 * stop)
+                tp1 = max(tp1, entry + 1.00 * stop)
+                tp2 = min(asia_hi, entry + 1.8 * stop)
                 build_trade("session_scalp", "BUY", entry, sl, tp1, tp2, "quét đáy phiên Á rồi đóng lại trong range", "Hủy nếu đóng dưới đáy quét phiên Á", 8, 120, 5)
-            elif sweep_asia_high:
+            elif sweep_asia_high and not session_up_impulse:
                 entry = close
                 sl = high + 0.12 * a
-                tp1 = asia_mid
-                tp2 = max(asia_lo, entry - 1.8 * abs(entry - sl))
+                stop = abs(entry - sl)
+                tp1 = max(float(asia_mid), entry - 1.30 * stop)
+                tp1 = min(tp1, entry - 1.00 * stop)
+                tp2 = max(asia_lo, entry - 1.8 * stop)
                 build_trade("session_scalp", "SELL", entry, sl, tp1, tp2, "quét đỉnh phiên Á rồi đóng lại trong range", "Hủy nếu đóng trên đỉnh quét phiên Á", 8, 120, 5)
-            elif sweep_recent_low:
+            elif sweep_recent_low and not session_dn_impulse:
                 entry = close
                 sl = low - 0.10 * a
-                tp1 = recent_mid
-                tp2 = min(recent_hi, entry + 1.5 * abs(entry - sl))
+                stop = abs(entry - sl)
+                tp1 = min(float(recent_mid), entry + 1.25 * stop)
+                tp1 = max(tp1, entry + 1.00 * stop)
+                tp2 = min(recent_hi, entry + 1.5 * stop)
                 build_trade("session_scalp", "BUY", entry, sl, tp1, tp2, "quét đáy range gần nhất trong phiên thanh khoản", "Hủy nếu đóng dưới đáy quét range gần", 7, 116, 4, 0.85)
-            elif sweep_recent_high:
+            elif sweep_recent_high and not session_up_impulse:
                 entry = close
                 sl = high + 0.10 * a
-                tp1 = recent_mid
-                tp2 = max(recent_lo, entry - 1.5 * abs(entry - sl))
+                stop = abs(entry - sl)
+                tp1 = max(float(recent_mid), entry - 1.25 * stop)
+                tp1 = min(tp1, entry - 1.00 * stop)
+                tp2 = max(recent_lo, entry - 1.5 * stop)
                 build_trade("session_scalp", "SELL", entry, sl, tp1, tp2, "quét đỉnh range gần nhất trong phiên thanh khoản", "Hủy nếu đóng trên đỉnh quét range gần", 7, 116, 4, 0.85)
             else:
-                set_wait_status("session_scalp", "NO TRADE | chưa có sweep range phiên Á + nến xác nhận", buy_h=asia_lo, sell_h=asia_hi)
+                miss = []
+                if session_up_impulse:
+                    miss.append("đang up-impulse mạnh, tránh SELL ngược đà")
+                if session_dn_impulse:
+                    miss.append("đang down-impulse mạnh, tránh BUY ngược đà")
+                miss.append("chưa có sweep range phiên Á + nến xác nhận")
+                set_wait_status("session_scalp", why_missing(miss, "NO TRADE | Session scalp chưa đủ điều kiện"), buy_h=asia_lo, sell_h=asia_hi)
         elif in_session:
             set_wait_status("session_scalp", "NO TRADE | phiên Á quá rộng/thiếu dữ liệu")
         else:
