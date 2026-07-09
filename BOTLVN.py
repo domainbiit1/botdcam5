@@ -86,6 +86,7 @@ if _WORKER_MODE:
 _stop = threading.Event()
 _send_lock = threading.Lock()
 BOT_BUILD = "2026-07-08-mode2-all6-v15"
+MODE2_MEAN_REV_LOCK_MINUTES = 90
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
@@ -1482,26 +1483,55 @@ def compute_mode2_m1_scalp_signal(cfg):
 
     # 3) Mean Reversion
     if strat_on("mean_reversion"):
-        sideway_ok = range_w_40 >= 1.2 * a and range_w_40 <= 8.5 * a and trend_strength < 0.85 and not (trend_buy and close > float(ema20.iloc[i]) + 0.2 * a) and not (trend_sell and close < float(ema20.iloc[i]) - 0.2 * a)
+        ema20_now = float(ema20.iloc[i])
+        ema50_now = float(ema50.iloc[i])
+        ema200_now = float(ema200.iloc[i])
+        sideway_ok = (
+            range_w_40 >= 1.2 * a
+            and range_w_40 <= 8.5 * a
+            and trend_strength < 0.85
+            and not (trend_buy and close > ema20_now + 0.2 * a)
+            and not (trend_sell and close < ema20_now - 0.2 * a)
+        )
         breakout_risk = body >= 0.80 * rng and (close > range_hi_20 + 0.12 * a or close < range_lo_20 - 0.12 * a)
-        if sideway_ok and (not breakout_risk) and low <= bb_dn_now and close > bb_dn_now and rsi_now <= 38:
+        up_impulse = (
+            close > ema20_now > ema50_now
+            and close > ema200_now
+            and close > range_hi_20 + 0.08 * a
+            and rsi_now >= 60
+            and body >= 0.55 * rng
+        )
+        down_impulse = (
+            close < ema20_now < ema50_now
+            and close < ema200_now
+            and close < range_lo_20 - 0.08 * a
+            and rsi_now <= 40
+            and body >= 0.55 * rng
+        )
+        buy_allowed = not down_impulse
+        sell_allowed = not up_impulse
+        if sideway_ok and (not breakout_risk) and buy_allowed and low <= bb_dn_now and close > bb_dn_now and rsi_now <= 38:
             entry = close
             sl = min(low - 0.15 * a, range_lo_20 - 0.10 * a)
             tp1 = bb_mid_now
             tp2 = min(range_hi_20, entry + 1.7 * abs(entry - sl))
-            build_trade("mean_reversion", "BUY", entry, sl, tp1, tp2, "sideway + chạm BB dưới + RSI quá bán", "Hủy nếu breakdown thật sự dưới range", 7, 70, 5)
-        elif sideway_ok and (not breakout_risk) and high >= bb_up_now and close < bb_up_now and rsi_now >= 62:
+            build_trade("mean_reversion", "BUY", entry, sl, tp1, tp2, "sideway + chạm BB dưới + RSI quá bán", "Hủy nếu breakdown thật sự dưới range", 7, 70, 5, 0.75)
+        elif sideway_ok and (not breakout_risk) and sell_allowed and high >= bb_up_now and close < bb_up_now and rsi_now >= 62:
             entry = close
             sl = max(high + 0.15 * a, range_hi_20 + 0.10 * a)
             tp1 = bb_mid_now
             tp2 = max(range_lo_20, entry - 1.7 * abs(entry - sl))
-            build_trade("mean_reversion", "SELL", entry, sl, tp1, tp2, "sideway + chạm BB trên + RSI quá mua", "Hủy nếu breakout thật sự khỏi range", 7, 70, 5)
+            build_trade("mean_reversion", "SELL", entry, sl, tp1, tp2, "sideway + chạm BB trên + RSI quá mua", "Hủy nếu breakout thật sự khỏi range", 7, 70, 5, 0.75)
         else:
             miss = []
             if not sideway_ok:
                 miss.append("thị trường chưa đủ sideway")
             if breakout_risk:
                 miss.append("nguy cơ breakout mạnh khỏi range")
+            if not buy_allowed:
+                miss.append("đang có down-impulse, tránh bắt đáy")
+            if not sell_allowed:
+                miss.append("đang có up-impulse, tránh bắt đỉnh")
             if not (low <= bb_dn_now or high >= bb_up_now):
                 miss.append("chưa chạm biên Bollinger")
             if not (rsi_now <= 40 or rsi_now >= 60):
@@ -2447,10 +2477,21 @@ def run_worker(cfg):
                                 srt["signal_reason"] = f"blocked opposite: mode2 lock {','.join(sorted(open_sides))}"
                                 if sig_time > 0:
                                     srt["last_time"] = sig_time
-                                log(
-                                    f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] Block {selected_side}: direction lock {','.join(sorted(open_sides))}",
-                                    "info",
+                                block_key = f"{selected_side}|{','.join(sorted(open_sides))}"
+                                should_log_block = (
+                                    sig_time > 0
+                                    and (
+                                        int(srt.get("last_block_time", 0)) != int(sig_time)
+                                        or srt.get("last_block_key") != block_key
+                                    )
                                 )
+                                if should_log_block:
+                                    srt["last_block_time"] = int(sig_time)
+                                    srt["last_block_key"] = block_key
+                                    log(
+                                        f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] Block {selected_side}: direction lock {','.join(sorted(open_sides))}",
+                                        "info",
+                                    )
                                 continue
                             active_signals.append(f"{MODE2_STRATEGY_LABELS.get(sid, sid)}:{s_side}")
                             if sig_time > 0 and sig_time != int(srt.get("last_time", 0)):
@@ -2461,17 +2502,19 @@ def run_worker(cfg):
                                         srt["last_signal"] = "WAIT"
                                         srt["signal_reason"] = f"NO TRADE | ưu tiên {MODE_LABELS.get(preferred_mode, preferred_mode)} cùng thanh M5"
                                         continue
+                                    lock_minutes = MODE2_MEAN_REV_LOCK_MINUTES if sid == "mean_reversion" else MODE2_SETUP_LOCK_MINUTES
+                                    min_losses = 1 if sid == "mean_reversion" else 2
                                     locked, loss_streak = is_setup_temporarily_locked(
                                         cfg,
                                         mode,
                                         sid,
-                                        lock_minutes=MODE2_SETUP_LOCK_MINUTES,
-                                        min_losses=2,
+                                        lock_minutes=lock_minutes,
+                                        min_losses=min_losses,
                                     )
                                     if locked:
                                         srt["last_signal"] = "WAIT"
                                         srt["signal_reason"] = (
-                                            f"NO TRADE | setup lock {MODE2_SETUP_LOCK_MINUTES}m sau {loss_streak} lệnh thua liên tiếp"
+                                            f"NO TRADE | setup lock {lock_minutes}m sau {loss_streak} lệnh thua liên tiếp"
                                         )
                                         continue
                                     s_sig = dict(sig)
