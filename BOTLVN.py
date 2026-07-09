@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-09-mode2-focus-opt-v18"
+BOT_BUILD = "2026-07-09-mode2-focus-opt-v19"
 MODE2_MEAN_REV_LOCK_MINUTES = 90
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
@@ -136,6 +136,7 @@ MODE2_SETUP_LOCK_MINUTES = 45
 _today_mode_cache = {}
 _setup_lock_cache = {}
 _closed_deal_log_cache = {}
+_mode2_be_cache = {}
 
 
 def send(obj):
@@ -361,6 +362,87 @@ def mode_open_sides(cfg, mode_id):
         elif ptype == int(mt5.POSITION_TYPE_SELL):
             out.add("SELL")
     return out
+
+
+def manage_mode2_break_even(cfg):
+    """Move SL to BE(+buffer) for Mode 2 positions once price reaches >=1R."""
+    if mt5 is None:
+        return
+    mode_id = MODE_SCALP_M1_2
+    positions = my_positions(cfg, mode_id)
+    if not positions:
+        return
+    info = mt5.symbol_info(cfg["symbol"])
+    tick = mt5.symbol_info_tick(cfg["symbol"])
+    if info is None or tick is None:
+        return
+    point = float(getattr(info, "point", 0.01) or 0.01)
+    digits = int(getattr(info, "digits", 2) or 2)
+    min_stop_dist = float(getattr(info, "trade_stops_level", 0.0) or 0.0) * point
+    ask = float(getattr(tick, "ask", 0.0) or 0.0)
+    bid = float(getattr(tick, "bid", 0.0) or 0.0)
+
+    for p in positions:
+        try:
+            ticket = int(getattr(p, "ticket", 0) or 0)
+            if ticket <= 0:
+                continue
+            side = "BUY" if int(getattr(p, "type", -1)) == int(mt5.POSITION_TYPE_BUY) else "SELL"
+            entry = float(getattr(p, "price_open", 0.0) or 0.0)
+            sl_cur = float(getattr(p, "sl", 0.0) or 0.0)
+            tp_cur = float(getattr(p, "tp", 0.0) or 0.0)
+            vol = float(getattr(p, "volume", 0.0) or 0.0)
+            sid = strategy_id_from_comment(getattr(p, "comment", ""), mode_id) or "-"
+            if entry <= 0 or sl_cur <= 0:
+                continue
+
+            st = _mode2_be_cache.get(ticket, {})
+            init_risk = float(st.get("init_risk", 0.0) or 0.0)
+            if init_risk <= 0:
+                init_risk = abs(entry - sl_cur)
+            if init_risk <= 0:
+                continue
+            _mode2_be_cache[ticket] = {"init_risk": init_risk, "be_done": bool(st.get("be_done", False))}
+
+            move = (bid - entry) if side == "BUY" else (entry - ask)
+            if move < init_risk * 1.0:
+                continue
+
+            be_lock = max(0.08 * init_risk, min_stop_dist * 1.1, point * 8.0)
+            new_sl = (entry + be_lock) if side == "BUY" else (entry - be_lock)
+
+            if side == "BUY":
+                max_allowed = bid - max(min_stop_dist * 1.05, point * 2.0)
+                new_sl = min(new_sl, max_allowed)
+                if new_sl <= sl_cur + point * 0.5:
+                    continue
+            else:
+                min_allowed = ask + max(min_stop_dist * 1.05, point * 2.0)
+                new_sl = max(new_sl, min_allowed)
+                if new_sl >= sl_cur - point * 0.5:
+                    continue
+
+            req = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": cfg["symbol"],
+                "position": ticket,
+                "sl": round(new_sl, digits),
+                "tp": round(tp_cur, digits) if tp_cur > 0 else 0.0,
+                "magic": int(getattr(p, "magic", 0) or 0),
+                "comment": "EGSBE",
+            }
+            res = mt5.order_send(req)
+            if res is None or getattr(res, "retcode", None) != mt5.TRADE_RETCODE_DONE:
+                continue
+
+            _mode2_be_cache[ticket] = {"init_risk": init_risk, "be_done": True}
+            log(
+                f"[Mode 2 - BE/{MODE2_STRATEGY_LABELS.get(sid, sid)}] ticket={ticket} {side} vol={vol:.2f} "
+                f"move={move:.2f} (>=1R {init_risk:.2f}) | SL {sl_cur:.2f} -> {new_sl:.2f}",
+                "info",
+            )
+        except Exception:
+            continue
 
 
 def normalize_mode_settings(cfg):
@@ -2283,6 +2365,7 @@ def run_worker(cfg):
     active_mode_label = ", ".join(active_mode_labels)
     last_heartbeat_t = 0.0
     last_deal_diag_t = 0.0
+    last_be_manage_t = 0.0
     worker_started_ts = int(time.time())
     def _fmt_px(v):
         return f"{float(v):.2f}" if isinstance(v, (int, float)) else "-"
@@ -2318,6 +2401,12 @@ def run_worker(cfg):
             if now - last_deal_diag_t >= 15.0:
                 log_recent_closed_deals(cfg, lookback_hours=24, started_ts=worker_started_ts)
                 last_deal_diag_t = now
+            if now - last_be_manage_t >= 1.0:
+                try:
+                    manage_mode2_break_even(cfg)
+                except Exception as be_exc:
+                    log(f"[Mode 2 - BE] manager error: {be_exc}", "warn")
+                last_be_manage_t = now
             cycle_signals = {}
             if MODE_LVN_1 in enabled_modes:
                 sig1 = compute_mode1_lvn_signal(cfg)
