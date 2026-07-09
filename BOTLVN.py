@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-08-mode2-all6-v15"
+BOT_BUILD = "2026-07-09-mode2-focus-opt-v16"
 MODE2_MEAN_REV_LOCK_MINUTES = 90
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
