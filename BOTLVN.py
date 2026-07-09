@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-09-mode2-focus-opt-v16"
+BOT_BUILD = "2026-07-09-mode2-focus-opt-v17"
 MODE2_MEAN_REV_LOCK_MINUTES = 90
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
@@ -1513,14 +1513,24 @@ def compute_mode2_m1_scalp_signal(cfg):
         if sideway_ok and (not breakout_risk) and buy_allowed and low <= bb_dn_now and close > bb_dn_now and rsi_now <= 38:
             entry = close
             sl = min(low - 0.15 * a, range_lo_20 - 0.10 * a)
-            tp1 = bb_mid_now
-            tp2 = min(range_hi_20, entry + 1.7 * abs(entry - sl))
+            stop = abs(entry - sl)
+            tp1_raw = float(bb_mid_now)
+            tp1 = min(tp1_raw, entry + 1.25 * stop)
+            tp1 = max(tp1, entry + 0.90 * stop)
+            tp2 = min(range_hi_20, entry + 1.7 * stop)
+            if tp2 <= tp1:
+                tp2 = tp1 + 0.35 * stop
             build_trade("mean_reversion", "BUY", entry, sl, tp1, tp2, "sideway + chạm BB dưới + RSI quá bán", "Hủy nếu breakdown thật sự dưới range", 7, 70, 5, 0.75)
         elif sideway_ok and (not breakout_risk) and sell_allowed and high >= bb_up_now and close < bb_up_now and rsi_now >= 62:
             entry = close
             sl = max(high + 0.15 * a, range_hi_20 + 0.10 * a)
-            tp1 = bb_mid_now
-            tp2 = max(range_lo_20, entry - 1.7 * abs(entry - sl))
+            stop = abs(entry - sl)
+            tp1_raw = float(bb_mid_now)
+            tp1 = max(tp1_raw, entry - 1.25 * stop)
+            tp1 = min(tp1, entry - 0.90 * stop)
+            tp2 = max(range_lo_20, entry - 1.7 * stop)
+            if tp2 >= tp1:
+                tp2 = tp1 - 0.35 * stop
             build_trade("mean_reversion", "SELL", entry, sl, tp1, tp2, "sideway + chạm BB trên + RSI quá mua", "Hủy nếu breakout thật sự khỏi range", 7, 70, 5, 0.75)
         else:
             miss = []
