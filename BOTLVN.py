@@ -85,18 +85,21 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-09-mode2-session-tuning-v23"
+BOT_BUILD = "2026-07-09-mode3-dca-m5-v24"
 MODE2_MEAN_REV_LOCK_MINUTES = 90
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
 MODE_SCALP_M1_2 = "mode2_m1_pullback"
+MODE_DCA_M5_3 = "mode3_dca_m5"
 MODE_LABELS = {
     MODE_LVN_1: "Mode 1 - LVN Profile Pro",
     MODE_SCALP_M1_2: "Mode 2 - M5 Six-Strategy Selector",
+    MODE_DCA_M5_3: "Mode 3 - DCA M5 Safe",
 }
 MODE_MAGIC_OFFSETS = {
     MODE_LVN_1: 11,
     MODE_SCALP_M1_2: 22,
+    MODE_DCA_M5_3: 33,
 }
 DEFAULT_ACTIVE_MODES = [MODE_LVN_1, MODE_SCALP_M1_2]
 MODE2_STRATEGY_LABELS = {
@@ -110,6 +113,7 @@ MODE2_STRATEGY_LABELS = {
 MODE_SHORT = {
     MODE_LVN_1: "m1",
     MODE_SCALP_M1_2: "m2",
+    MODE_DCA_M5_3: "m3",
 }
 MODE_SHORT_INV = {v: k for k, v in MODE_SHORT.items()}
 MODE2_STRATEGY_SHORT = {
@@ -132,11 +136,17 @@ MODE2_MIN_SCORE = 0
 MODE2_RR_MIN = 1.2
 MODE2_SL_MAX = 6.0
 MODE2_SETUP_LOCK_MINUTES = 45
+MODE3_DCA_MAX_LAYERS = 3
+MODE3_DCA_SPACING_ATR = (0.7, 0.9)
+MODE3_DCA_LOT_FACTORS = (1.0, 1.3, 1.6)
+MODE3_DCA_BASKET_SL_PCT = 1.5
+MODE3_DCA_BASKET_TP_PCT = 1.0
 
 _today_mode_cache = {}
 _setup_lock_cache = {}
 _closed_deal_log_cache = {}
 _mode2_be_cache = {}
+_mode3_dca_cache = {}
 MODE2_BE_RULES = {
     # be_r: move to BE+buffer at this R
     # lock_r / lock_gain_r: lock profit at this R (SL = entry +/- lock_gain_r * R)
@@ -1981,8 +1991,311 @@ def compute_mode2_m1_scalp_signal(cfg):
     }
 
 
+def close_position_market(cfg, pos, note="mode-close"):
+    info = mt5.symbol_info(cfg["symbol"])
+    tick = mt5.symbol_info_tick(cfg["symbol"])
+    if info is None or tick is None:
+        return False, "symbol/tick unavailable"
+    ptype = int(getattr(pos, "type", -1))
+    side = "BUY" if ptype == int(mt5.POSITION_TYPE_BUY) else "SELL"
+    close_type = mt5.ORDER_TYPE_SELL if side == "BUY" else mt5.ORDER_TYPE_BUY
+    price = float(getattr(tick, "bid", 0.0) if side == "BUY" else getattr(tick, "ask", 0.0))
+    req_base = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": cfg["symbol"],
+        "position": int(getattr(pos, "ticket", 0) or 0),
+        "volume": float(getattr(pos, "volume", 0.0) or 0.0),
+        "type": close_type,
+        "price": price,
+        "deviation": int(cfg.get("deviation", 25)),
+        "magic": int(getattr(pos, "magic", 0) or 0),
+        "comment": "EGSM3EXIT",
+        "type_time": mt5.ORDER_TIME_GTC,
+    }
+    fill_modes = [int(getattr(info, "filling_mode", -1)), mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
+    last_err = ""
+    for fm in fill_modes:
+        if not isinstance(fm, int) or fm < 0:
+            continue
+        req = dict(req_base)
+        req["type_filling"] = fm
+        res = mt5.order_send(req)
+        if res is not None and getattr(res, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+            return True, "ok"
+        last_err = f"ret={getattr(res, 'retcode', None)} comment={getattr(res, 'comment', '')} last_error={mt5.last_error()}"
+    return False, f"close failed | {note} | {last_err}"
+
+
+def close_mode_positions(cfg, mode_id, reason="manual"):
+    pos = my_positions(cfg, mode_id)
+    if not pos:
+        return True, "no positions"
+    ok_count = 0
+    fail_msgs = []
+    for p in pos:
+        ok, msg = close_position_market(cfg, p, note=reason)
+        if ok:
+            ok_count += 1
+        else:
+            fail_msgs.append(msg)
+    if fail_msgs:
+        return False, f"closed={ok_count}/{len(pos)} | " + " | ".join(fail_msgs[:2])
+    return True, f"closed={ok_count}/{len(pos)}"
+
+
+def _mode3_snapshot(cfg, atr_now):
+    pos = my_positions(cfg, MODE_DCA_M5_3)
+    if not pos:
+        return {
+            "layers": 0,
+            "side": None,
+            "avg_entry": None,
+            "floating": 0.0,
+            "next_add_price": None,
+            "next_lot_factor": MODE3_DCA_LOT_FACTORS[0],
+        }
+    sides = set()
+    entries = []
+    volumes = []
+    floating = 0.0
+    for p in pos:
+        ptype = int(getattr(p, "type", -1))
+        if ptype == int(mt5.POSITION_TYPE_BUY):
+            sides.add("BUY")
+        elif ptype == int(mt5.POSITION_TYPE_SELL):
+            sides.add("SELL")
+        px = float(getattr(p, "price_open", 0.0) or 0.0)
+        vol = float(getattr(p, "volume", 0.0) or 0.0)
+        if px > 0 and vol > 0:
+            entries.append(px)
+            volumes.append(vol)
+        floating += float(getattr(p, "profit", 0.0) or 0.0)
+    if not entries:
+        return {
+            "layers": len(pos),
+            "side": "MIXED" if len(sides) != 1 else list(sides)[0],
+            "avg_entry": None,
+            "floating": floating,
+            "next_add_price": None,
+            "next_lot_factor": MODE3_DCA_LOT_FACTORS[min(len(pos), len(MODE3_DCA_LOT_FACTORS) - 1)],
+        }
+    avg_entry = float(np.average(np.array(entries, dtype=float), weights=np.array(volumes, dtype=float)))
+    side = list(sides)[0] if len(sides) == 1 else "MIXED"
+    layers = len(pos)
+    spacing = MODE3_DCA_SPACING_ATR[0] if layers <= 1 else MODE3_DCA_SPACING_ATR[1]
+    if side == "BUY":
+        edge = min(entries)
+        next_add = edge - float(spacing) * atr_now
+    elif side == "SELL":
+        edge = max(entries)
+        next_add = edge + float(spacing) * atr_now
+    else:
+        next_add = None
+    return {
+        "layers": layers,
+        "side": side,
+        "avg_entry": avg_entry,
+        "floating": floating,
+        "next_add_price": next_add,
+        "next_lot_factor": MODE3_DCA_LOT_FACTORS[min(layers, len(MODE3_DCA_LOT_FACTORS) - 1)],
+    }
+
+
+def compute_mode3_dca_signal(cfg):
+    bars = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M5, 0, 900)
+    if bars is None or len(bars) < 320:
+        return None
+    df = pd.DataFrame(bars).iloc[:-1].reset_index(drop=True)
+    if len(df) < 320:
+        return None
+    atr = atr_series(df, 14)
+    ema20 = df["close"].ewm(span=20, adjust=False).mean()
+    ema50 = df["close"].ewm(span=50, adjust=False).mean()
+    ema200 = df["close"].ewm(span=200, adjust=False).mean()
+    rsi = rsi_series(df["close"].astype(float), 14)
+
+    bars_m15 = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_M15, 0, 320)
+    bars_h1 = mt5.copy_rates_from_pos(cfg["symbol"], mt5.TIMEFRAME_H1, 0, 260)
+    if bars_m15 is None or len(bars_m15) < 120 or bars_h1 is None or len(bars_h1) < 100:
+        return None
+    d15 = pd.DataFrame(bars_m15).iloc[:-1].reset_index(drop=True)
+    dh1 = pd.DataFrame(bars_h1).iloc[:-1].reset_index(drop=True)
+    e20_15 = d15["close"].ewm(span=20, adjust=False).mean()
+    e50_15 = d15["close"].ewm(span=50, adjust=False).mean()
+    e200_15 = d15["close"].ewm(span=200, adjust=False).mean()
+    e20_h1 = dh1["close"].ewm(span=20, adjust=False).mean()
+    e50_h1 = dh1["close"].ewm(span=50, adjust=False).mean()
+    e200_h1 = dh1["close"].ewm(span=200, adjust=False).mean()
+
+    i = len(df) - 1
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+    t_now = int(row["time"])
+    close = float(row["close"])
+    open_ = float(row["open"])
+    high = float(row["high"])
+    low = float(row["low"])
+    a = float(atr.iloc[i]) if float(atr.iloc[i]) > 0 else 0.0
+    if a <= 0:
+        return None
+
+    atr_hist = atr.iloc[max(0, i - 288): i + 1].dropna().to_numpy(dtype=float)
+    atr_rank = float((atr_hist <= a).sum()) / float(len(atr_hist)) if len(atr_hist) >= 8 else 0.5
+    trend_strength = abs(float(e20_15.iloc[-1]) - float(e50_15.iloc[-1])) / max(1e-9, a)
+    body = abs(close - open_)
+    rng = max(1e-9, high - low)
+    rsi_now = float(rsi.iloc[i])
+
+    trend_h1_up = float(dh1["close"].iloc[-1]) > float(e50_h1.iloc[-1]) > float(e200_h1.iloc[-1]) and float(e20_h1.iloc[-1]) > float(e50_h1.iloc[-1])
+    trend_h1_dn = float(dh1["close"].iloc[-1]) < float(e50_h1.iloc[-1]) < float(e200_h1.iloc[-1]) and float(e20_h1.iloc[-1]) < float(e50_h1.iloc[-1])
+    trend_m15_up = float(d15["close"].iloc[-1]) > float(e50_15.iloc[-1]) > float(e200_15.iloc[-1]) and float(e20_15.iloc[-1]) > float(e50_15.iloc[-1])
+    trend_m15_dn = float(d15["close"].iloc[-1]) < float(e50_15.iloc[-1]) < float(e200_15.iloc[-1]) and float(e20_15.iloc[-1]) < float(e50_15.iloc[-1])
+    trend_up = trend_m15_up or (trend_h1_up and close > float(ema20.iloc[i]))
+    trend_dn = trend_m15_dn or (trend_h1_dn and close < float(ema20.iloc[i]))
+
+    snapshot = _mode3_snapshot(cfg, a)
+    acc = mt5.account_info()
+    bal = float(getattr(acc, "balance", 0.0) or 0.0) if acc is not None else 0.0
+    basket_sl_money = -bal * float(cfg.get("mode3_dca_basket_sl_pct", MODE3_DCA_BASKET_SL_PCT)) / 100.0 if bal > 0 else -999999.0
+    basket_tp_money = bal * float(cfg.get("mode3_dca_basket_tp_pct", MODE3_DCA_BASKET_TP_PCT)) / 100.0 if bal > 0 else 999999.0
+
+    side = None
+    reason = "NO TRADE | DCA waiting setup"
+    entry = 0.0
+    sl = 0.0
+    tp1 = 0.0
+    tp2 = 0.0
+    rr = 0.0
+    lot_factor = 1.0
+    dca_action = "hold"
+    close_reason = ""
+    max_layers = int(cfg.get("mode3_dca_max_layers", MODE3_DCA_MAX_LAYERS))
+    buy_hint = float(ema20.iloc[i])
+    sell_hint = float(ema20.iloc[i])
+
+    if snapshot["layers"] > 0:
+        side_now = str(snapshot.get("side"))
+        floating = float(snapshot.get("floating", 0.0))
+        avg_entry = float(snapshot.get("avg_entry", close) or close)
+        next_add = snapshot.get("next_add_price")
+        if isinstance(next_add, (int, float)):
+            if side_now == "BUY":
+                buy_hint = float(next_add)
+                sell_hint = float(avg_entry + 0.8 * a)
+            elif side_now == "SELL":
+                sell_hint = float(next_add)
+                buy_hint = float(avg_entry - 0.8 * a)
+        if side_now == "MIXED":
+            dca_action = "close_all"
+            close_reason = "DCA mixed sides detected"
+            reason = "NO TRADE | mixed BUY/SELL trong cùng giỏ DCA"
+        elif floating <= basket_sl_money:
+            dca_action = "close_all"
+            close_reason = f"Basket SL hit ({floating:.2f} <= {basket_sl_money:.2f})"
+            reason = "NO TRADE | Basket SL kích hoạt"
+        elif floating >= basket_tp_money:
+            dca_action = "close_all"
+            close_reason = f"Basket TP hit ({floating:.2f} >= {basket_tp_money:.2f})"
+            reason = "NO TRADE | Basket TP kích hoạt"
+        else:
+            trend_broken = (side_now == "BUY" and trend_dn and close < float(ema50.iloc[i])) or (side_now == "SELL" and trend_up and close > float(ema50.iloc[i]))
+            if trend_broken and floating < 0:
+                dca_action = "close_all"
+                close_reason = f"Trend break against basket ({side_now})"
+                reason = "NO TRADE | Trend break ngược giỏ DCA"
+            else:
+                can_add = snapshot["layers"] < max_layers and isinstance(next_add, (int, float))
+                if side_now == "BUY" and can_add and close <= float(next_add) and trend_up and rsi_now >= 35:
+                    side = "BUY"
+                    dca_action = "add"
+                    lot_factor = float(snapshot.get("next_lot_factor", 1.0))
+                    entry = close
+                    sl = min(float(df["low"].iloc[i - 24:i].min()), close - 1.8 * a)
+                    tp1 = avg_entry + 0.8 * a
+                    tp2 = avg_entry + 2.2 * a
+                    rr = abs(tp2 - entry) / max(1e-9, abs(entry - sl))
+                    reason = (
+                        f"DCA ADD BUY lớp {snapshot['layers'] + 1}/{max_layers} | "
+                        f"avg={avg_entry:.2f} next_add={float(next_add):.2f} floating={floating:+.2f}"
+                    )
+                elif side_now == "SELL" and can_add and close >= float(next_add) and trend_dn and rsi_now <= 65:
+                    side = "SELL"
+                    dca_action = "add"
+                    lot_factor = float(snapshot.get("next_lot_factor", 1.0))
+                    entry = close
+                    sl = max(float(df["high"].iloc[i - 24:i].max()), close + 1.8 * a)
+                    tp1 = avg_entry - 0.8 * a
+                    tp2 = avg_entry - 2.2 * a
+                    rr = abs(tp2 - entry) / max(1e-9, abs(entry - sl))
+                    reason = (
+                        f"DCA ADD SELL lớp {snapshot['layers'] + 1}/{max_layers} | "
+                        f"avg={avg_entry:.2f} next_add={float(next_add):.2f} floating={floating:+.2f}"
+                    )
+                else:
+                    reason = (
+                        f"NO TRADE | DCA HOLD {side_now} | layers={snapshot['layers']}/{max_layers} "
+                        f"avg={avg_entry:.2f} floating={floating:+.2f}"
+                    )
+    else:
+        pullback_buy = low <= float(ema20.iloc[i]) + 0.15 * a and close > float(ema20.iloc[i]) and close > float(prev["close"]) and close > open_ and rsi_now >= 45
+        pullback_sell = high >= float(ema20.iloc[i]) - 0.15 * a and close < float(ema20.iloc[i]) and close < float(prev["close"]) and close < open_ and rsi_now <= 55
+        if trend_up and pullback_buy:
+            side = "BUY"
+            dca_action = "open"
+            lot_factor = MODE3_DCA_LOT_FACTORS[0]
+            entry = close
+            sl = min(float(df["low"].iloc[i - 16:i].min()), close - 1.6 * a)
+            tp1 = entry + abs(entry - sl)
+            tp2 = entry + 1.8 * abs(entry - sl)
+            rr = abs(tp2 - entry) / max(1e-9, abs(entry - sl))
+            reason = "DCA OPEN BUY | trend-up + pullback EMA20 + nến xác nhận"
+        elif trend_dn and pullback_sell:
+            side = "SELL"
+            dca_action = "open"
+            lot_factor = MODE3_DCA_LOT_FACTORS[0]
+            entry = close
+            sl = max(float(df["high"].iloc[i - 16:i].max()), close + 1.6 * a)
+            tp1 = entry - abs(entry - sl)
+            tp2 = entry - 1.8 * abs(entry - sl)
+            rr = abs(tp2 - entry) / max(1e-9, abs(entry - sl))
+            reason = "DCA OPEN SELL | trend-down + pullback EMA20 + nến xác nhận"
+        else:
+            reason = "NO TRADE | chưa có trend pullback setup cho DCA M5"
+            buy_hint = float(ema20.iloc[i] - 0.15 * a)
+            sell_hint = float(ema20.iloc[i] + 0.15 * a)
+
+    return {
+        "side": side,
+        "reason": reason,
+        "m5_time": t_now,
+        "close": close,
+        "atr": a,
+        "lvn": float(ema20.iloc[i]),
+        "buy_price_hint": buy_hint,
+        "sell_price_hint": sell_hint,
+        "atr_rank": atr_rank,
+        "trend_strength": trend_strength,
+        "strategy_id": "dca_m5",
+        "entry": float(entry) if entry else 0.0,
+        "sl": float(sl) if sl else 0.0,
+        "tp1": float(tp1) if tp1 else 0.0,
+        "tp2": float(tp2) if tp2 else 0.0,
+        "rr": float(rr),
+        "tp": float(tp2) if tp2 else None,
+        "lot_factor": float(lot_factor),
+        "dca_action": dca_action,
+        "close_reason": close_reason,
+        "dca_layers": int(snapshot.get("layers", 0)),
+        "dca_max_layers": int(max_layers),
+        "dca_floating": float(snapshot.get("floating", 0.0)),
+        "dca_next_add": snapshot.get("next_add_price"),
+        "dca_basket_sl_money": float(basket_sl_money),
+        "dca_basket_tp_money": float(basket_tp_money),
+    }
+
+
 def compute_signal_by_modes(cfg):
-    """Multi-mode dispatcher. Currently supports Mode 1 LVN."""
+    """Multi-mode dispatcher."""
     active_modes = get_active_modes(cfg)
     first_payload = None
     for mode in active_modes:
@@ -1991,6 +2304,8 @@ def compute_signal_by_modes(cfg):
             payload = compute_mode1_lvn_signal(cfg)
         elif mode == MODE_SCALP_M1_2:
             payload = compute_mode2_m1_scalp_signal(cfg)
+        elif mode == MODE_DCA_M5_3:
+            payload = compute_mode3_dca_signal(cfg)
         if payload is None:
             continue
         payload["mode"] = mode
@@ -2108,6 +2423,8 @@ def log_recent_closed_deals(cfg, lookback_hours=24, started_ts=None):
             sid = strategy_id_from_comment(open_comment or comment, mode_id)
             if mode_id == MODE_SCALP_M1_2:
                 strat_label = MODE2_STRATEGY_LABELS.get(sid or "", sid or "-")
+            elif mode_id == MODE_DCA_M5_3:
+                strat_label = "DCA M5"
             else:
                 strat_label = str(sid or "Mode1")
             reason_txt = _deal_reason_text(getattr(d, "reason", -1))
@@ -2500,6 +2817,9 @@ def run_worker(cfg):
     cfg.setdefault("atr_regime_window", 288)
     cfg.setdefault("deviation", 25)
     cfg.setdefault("fixed_lot_fallback", 0.01)
+    cfg.setdefault("mode3_dca_max_layers", MODE3_DCA_MAX_LAYERS)
+    cfg.setdefault("mode3_dca_basket_sl_pct", MODE3_DCA_BASKET_SL_PCT)
+    cfg.setdefault("mode3_dca_basket_tp_pct", MODE3_DCA_BASKET_TP_PCT)
     cfg.setdefault("active_modes", list(DEFAULT_ACTIVE_MODES))
     normalize_mode_settings(cfg)
 
@@ -2598,6 +2918,11 @@ def run_worker(cfg):
                 if sig2:
                     sig2["mode"] = MODE_SCALP_M1_2
                     cycle_signals[MODE_SCALP_M1_2] = sig2
+            if MODE_DCA_M5_3 in enabled_modes:
+                sig3 = compute_mode3_dca_signal(cfg)
+                if sig3:
+                    sig3["mode"] = MODE_DCA_M5_3
+                    cycle_signals[MODE_DCA_M5_3] = sig3
 
             preferred_mode = None
             sig1 = cycle_signals.get(MODE_LVN_1)
@@ -2845,6 +3170,71 @@ def run_worker(cfg):
                         mode_runtime[mode]["entry_hint"] = "Sell: - | Buy: -"
                         mode_runtime[mode]["buy_hint"] = None
                         mode_runtime[mode]["sell_hint"] = None
+                elif mode == MODE_DCA_M5_3:
+                    sig = cycle_signals.get(mode)
+                    if not sig:
+                        continue
+                    mode_label = MODE_LABELS.get(mode, mode)
+                    sig_side = sig.get("side")
+                    sig_time = int(sig.get("m5_time") or 0)
+                    s_reason = str(sig.get("reason", ""))
+                    dca_action = str(sig.get("dca_action", "hold"))
+                    buy_hint = sig.get("buy_price_hint")
+                    sell_hint = sig.get("sell_price_hint")
+                    buy_txt = f"Giá {buy_hint:.2f} - Buy" if isinstance(buy_hint, (int, float)) else "Buy: -"
+                    sell_txt = f"Giá {sell_hint:.2f} - Sell" if isinstance(sell_hint, (int, float)) else "Sell: -"
+                    hint_text = f"{sell_txt} | {buy_txt}"
+                    mode_runtime[mode]["last_signal"] = sig_side if sig_side in ("BUY", "SELL") else "WAIT"
+                    mode_runtime[mode]["signal_reason"] = s_reason
+                    mode_runtime[mode]["entry_hint"] = hint_text
+                    mode_runtime[mode]["buy_hint"] = buy_hint if isinstance(buy_hint, (int, float)) else None
+                    mode_runtime[mode]["sell_hint"] = sell_hint if isinstance(sell_hint, (int, float)) else None
+                    mode_runtime[mode]["strategy_label"] = "DCA M5 Core"
+                    layers = int(sig.get("dca_layers", 0) or 0)
+                    max_layers = int(sig.get("dca_max_layers", 0) or 0)
+                    floating = float(sig.get("dca_floating", 0.0) or 0.0)
+                    next_add = sig.get("dca_next_add")
+                    mode_runtime[mode]["profile_text"] = (
+                        f"{mode_label} | layers={layers}/{max_layers} | floating={floating:+.2f} | "
+                        f"next_add={_fmt_px(next_add)} | basketTP={float(sig.get('dca_basket_tp_money', 0.0)):+.2f} "
+                        f"basketSL={float(sig.get('dca_basket_sl_money', 0.0)):+.2f}"
+                    )
+
+                    if sig_time > 0 and sig_time != int(mode_runtime[mode]["last_diag_time"] if "last_diag_time" in mode_runtime[mode] else 0):
+                        mode_runtime[mode]["last_diag_time"] = sig_time
+                        log(
+                            f"[{mode_label}] {sig_side if sig_side in ('BUY','SELL') else 'WAIT'} "
+                            f"| action={dca_action} | layers={layers}/{max_layers} | close={_fmt_px(sig.get('close'))} "
+                            f"| watch_sell={_fmt_px(sell_hint)} | watch_buy={_fmt_px(buy_hint)} | reason={_one_line(s_reason)}",
+                            "info",
+                        )
+
+                    if dca_action == "close_all":
+                        if now - float(mode_runtime[mode].get("last_close_try_t", 0.0) or 0.0) >= 8.0:
+                            ok, msg = close_mode_positions(cfg, mode, reason=str(sig.get("close_reason", "mode3-close")))
+                            mode_runtime[mode]["last_close_try_t"] = now
+                            if ok:
+                                log(f"[{mode_label}] CLOSE-ALL executed | {msg} | reason={sig.get('close_reason', '-')}", "warn")
+                            else:
+                                log(f"[{mode_label}] CLOSE-ALL failed | {msg}", "warn")
+                    elif sig_side in ("BUY", "SELL"):
+                        if sig_time > 0 and sig_time != int(mode_runtime[mode]["last_time"]):
+                            mode_runtime[mode]["last_time"] = sig_time
+                            current_layers = len(my_positions(cfg, mode))
+                            if current_layers >= int(cfg.get("mode3_dca_max_layers", MODE3_DCA_MAX_LAYERS)):
+                                log(f"[{mode_label}] Signal {sig_side} but max DCA layers reached ({current_layers})", "info")
+                            else:
+                                s_sig = dict(sig)
+                                s_sig["strategy_id"] = "dca_m5"
+                                ok, reason = open_trade(cfg, sig_side, s_sig)
+                                if not ok:
+                                    log(f"[{mode_label}] Skip open {sig_side}: {reason}", "warn")
+
+                    if sig_side in ("BUY", "SELL"):
+                        last_signal = f"{mode_label}: {sig_side}"
+                        signal_reason = s_reason
+                        profile_text = mode_runtime[mode]["profile_text"]
+                        entry_hint = hint_text
 
             # Always expose signal state per enabled mode (even WAIT), so GUI
             # never looks blank while waiting for setups.
