@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-09-mode2-focus-opt-v17"
+BOT_BUILD = "2026-07-09-mode2-focus-opt-v18"
 MODE2_MEAN_REV_LOCK_MINUTES = 90
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
@@ -1191,6 +1191,10 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp2 = max(float(tp2), float(entry) + stop * 1.3)
             if tp2 <= tp1:
                 tp2 = tp1 + 0.15 * stop
+            # Ensure TP1/TP2 are visually and functionally separated.
+            min_tp_gap = max(0.60 * stop, 0.25 * a)
+            if (tp2 - tp1) < min_tp_gap:
+                tp2 = tp1 + min_tp_gap
             if tp2 <= float(entry):
                 set_wait_status(sid, "NO TRADE | TP không hợp lệ", buy_h=entry)
                 return
@@ -1199,6 +1203,10 @@ def compute_mode2_m1_scalp_signal(cfg):
             tp2 = min(float(tp2), float(entry) - stop * 1.3)
             if tp2 >= tp1:
                 tp2 = tp1 - 0.15 * stop
+            # Ensure TP1/TP2 are visually and functionally separated.
+            min_tp_gap = max(0.60 * stop, 0.25 * a)
+            if (tp1 - tp2) < min_tp_gap:
+                tp2 = tp1 - min_tp_gap
             if tp2 >= float(entry):
                 set_wait_status(sid, "NO TRADE | TP không hợp lệ", sell_h=entry)
                 return
