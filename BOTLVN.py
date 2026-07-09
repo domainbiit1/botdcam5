@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-09-mode2-tp1-partial-v21"
+BOT_BUILD = "2026-07-09-mode2-debug-logs-v22"
 MODE2_MEAN_REV_LOCK_MINUTES = 90
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
@@ -319,18 +319,18 @@ def count_strategy_positions(cfg, mode_id, strategy_id):
 
 def is_setup_temporarily_locked(cfg, mode_id, strategy_id, lock_minutes=45, min_losses=2):
     if not strategy_id or mode_id != MODE_SCALP_M1_2:
-        return False, 0
+        return False, 0, 0
     now = time.time()
     key = (id(cfg), mode_id, strategy_id, int(lock_minutes), int(min_losses))
     cached = _setup_lock_cache.get(key)
     if cached and now - float(cached.get("t", 0.0)) < 10.0:
-        return bool(cached.get("locked", False)), int(cached.get("losses", 0))
+        return bool(cached.get("locked", False)), int(cached.get("losses", 0)), int(cached.get("remaining_sec", 0))
     try:
         start = datetime.combine(datetime.now().date(), datetime.min.time())
         deals = mt5.history_deals_get(start, datetime.now())
         if deals is None:
-            _setup_lock_cache[key] = {"t": now, "locked": False, "losses": 0}
-            return False, 0
+            _setup_lock_cache[key] = {"t": now, "locked": False, "losses": 0, "remaining_sec": 0}
+            return False, 0, 0
         magic = int(mode_magic(cfg, mode_id))
         rows = []
         for d in deals:
@@ -354,13 +354,18 @@ def is_setup_temporarily_locked(cfg, mode_id, strategy_id, lock_minutes=45, min_
             else:
                 break
         locked = False
+        remaining_sec = 0
         if losses >= int(min_losses) and last_loss_ts > 0:
-            locked = (now - float(last_loss_ts)) <= float(lock_minutes) * 60.0
-        _setup_lock_cache[key] = {"t": now, "locked": locked, "losses": losses}
-        return locked, losses
+            lock_total = float(lock_minutes) * 60.0
+            elapsed = now - float(last_loss_ts)
+            locked = elapsed <= lock_total
+            if locked:
+                remaining_sec = max(0, int(lock_total - elapsed))
+        _setup_lock_cache[key] = {"t": now, "locked": locked, "losses": losses, "remaining_sec": remaining_sec}
+        return locked, losses, remaining_sec
     except Exception:
-        _setup_lock_cache[key] = {"t": now, "locked": False, "losses": 0}
-        return False, 0
+        _setup_lock_cache[key] = {"t": now, "locked": False, "losses": 0, "remaining_sec": 0}
+        return False, 0, 0
 
 
 def mode_open_sides(cfg, mode_id):
@@ -393,6 +398,7 @@ def manage_mode2_break_even(cfg):
     bid = float(getattr(tick, "bid", 0.0) or 0.0)
 
     active_tickets = set()
+    now_ts = time.time()
     for p in positions:
         try:
             ticket = int(getattr(p, "ticket", 0) or 0)
@@ -409,6 +415,14 @@ def manage_mode2_break_even(cfg):
                 continue
 
             st = _mode2_be_cache.get(ticket, {})
+            def log_once(diag_key, message, level="info", cooldown=45.0):
+                last_key = str(st.get("last_diag_key", ""))
+                last_t = float(st.get("last_diag_t", 0.0) or 0.0)
+                if last_key == str(diag_key) and (now_ts - last_t) < float(cooldown):
+                    return
+                st["last_diag_key"] = str(diag_key)
+                st["last_diag_t"] = float(now_ts)
+                log(message, level)
             init_risk = float(st.get("init_risk", 0.0) or 0.0)
             if init_risk <= 0:
                 init_risk = abs(entry - sl_cur)
@@ -424,6 +438,8 @@ def manage_mode2_break_even(cfg):
                 "stage": st_stage,
                 "tp1": tp1,
                 "tp1_done": tp1_done,
+                "last_diag_key": st.get("last_diag_key", ""),
+                "last_diag_t": float(st.get("last_diag_t", 0.0) or 0.0),
             }
 
             move = (bid - entry) if side == "BUY" else (entry - ask)
@@ -468,12 +484,28 @@ def manage_mode2_break_even(cfg):
                                 "stage": st_stage,
                                 "tp1": tp1,
                                 "tp1_done": True,
+                                "last_diag_key": "",
+                                "last_diag_t": 0.0,
                             }
                             log(
                                 f"[Mode 2 - TP1/{MODE2_STRATEGY_LABELS.get(sid, sid)}] ticket={ticket} {side} "
                                 f"close50%={close_vol:.2f}/{vol:.2f} @tp1={tp1:.2f}",
                                 "info",
                             )
+                        else:
+                            log_once(
+                                "tp1-send-fail",
+                                f"[Mode 2 - TP1/{MODE2_STRATEGY_LABELS.get(sid, sid)}] ticket={ticket} {side} "
+                                f"partial close failed | last_error={mt5.last_error()}",
+                                "warn",
+                            )
+                    else:
+                        log_once(
+                            "tp1-skip-volume",
+                            f"[Mode 2 - TP1/{MODE2_STRATEGY_LABELS.get(sid, sid)}] ticket={ticket} {side} "
+                            f"skip partial: volume too small ({vol:.2f})",
+                            "info",
+                        )
 
             rules = MODE2_BE_RULES.get(sid, {"be_r": 1.0, "lock_r": 1.5, "lock_gain_r": 0.30})
             move_r = move / max(1e-9, init_risk)
@@ -500,11 +532,23 @@ def manage_mode2_break_even(cfg):
                 max_allowed = bid - max(min_stop_dist * 1.05, point * 2.0)
                 new_sl = min(new_sl, max_allowed)
                 if new_sl <= sl_cur + point * 0.5:
+                    log_once(
+                        f"{target_stage}-skip-tight",
+                        f"[Mode 2 - {target_stage.upper()}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] "
+                        f"ticket={ticket} skip SL move: broker distance/tight spread",
+                        "info",
+                    )
                     continue
             else:
                 min_allowed = ask + max(min_stop_dist * 1.05, point * 2.0)
                 new_sl = max(new_sl, min_allowed)
                 if new_sl >= sl_cur - point * 0.5:
+                    log_once(
+                        f"{target_stage}-skip-tight",
+                        f"[Mode 2 - {target_stage.upper()}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] "
+                        f"ticket={ticket} skip SL move: broker distance/tight spread",
+                        "info",
+                    )
                     continue
 
             req = {
@@ -518,6 +562,13 @@ def manage_mode2_break_even(cfg):
             }
             res = mt5.order_send(req)
             if res is None or getattr(res, "retcode", None) != mt5.TRADE_RETCODE_DONE:
+                log_once(
+                    f"{target_stage}-sltp-fail",
+                    f"[Mode 2 - {target_stage.upper()}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] "
+                    f"ticket={ticket} SLTP modify failed ret={getattr(res, 'retcode', None)} "
+                    f"comment={getattr(res, 'comment', '')} last_error={mt5.last_error()}",
+                    "warn",
+                )
                 continue
 
             _mode2_be_cache[ticket] = {
@@ -525,6 +576,8 @@ def manage_mode2_break_even(cfg):
                 "stage": target_stage,
                 "tp1": tp1,
                 "tp1_done": tp1_done,
+                "last_diag_key": "",
+                "last_diag_t": 0.0,
             }
             log(
                 f"[Mode 2 - {target_stage.upper()}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] "
@@ -2722,7 +2775,7 @@ def run_worker(cfg):
                                         continue
                                     lock_minutes = MODE2_MEAN_REV_LOCK_MINUTES if sid == "mean_reversion" else MODE2_SETUP_LOCK_MINUTES
                                     min_losses = 1 if sid == "mean_reversion" else 2
-                                    locked, loss_streak = is_setup_temporarily_locked(
+                                    locked, loss_streak, remaining_sec = is_setup_temporarily_locked(
                                         cfg,
                                         mode,
                                         sid,
@@ -2730,9 +2783,10 @@ def run_worker(cfg):
                                         min_losses=min_losses,
                                     )
                                     if locked:
+                                        rem_min = max(1, int(np.ceil(float(remaining_sec) / 60.0)))
                                         srt["last_signal"] = "WAIT"
                                         srt["signal_reason"] = (
-                                            f"NO TRADE | setup lock {lock_minutes}m sau {loss_streak} lệnh thua liên tiếp"
+                                            f"NO TRADE | setup lock {lock_minutes}m sau {loss_streak} lệnh thua liên tiếp (còn ~{rem_min}m)"
                                         )
                                         continue
                                     s_sig = dict(sig)
