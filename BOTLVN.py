@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-09-mode2-focus-opt-v19"
+BOT_BUILD = "2026-07-09-mode2-be-matrix-v20"
 MODE2_MEAN_REV_LOCK_MINUTES = 90
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
@@ -137,6 +137,16 @@ _today_mode_cache = {}
 _setup_lock_cache = {}
 _closed_deal_log_cache = {}
 _mode2_be_cache = {}
+MODE2_BE_RULES = {
+    # be_r: move to BE+buffer at this R
+    # lock_r / lock_gain_r: lock profit at this R (SL = entry +/- lock_gain_r * R)
+    "trend_pullback": {"be_r": 0.9, "lock_r": 1.4, "lock_gain_r": 0.30},
+    "breakout": {"be_r": 1.2, "lock_r": 1.8, "lock_gain_r": 0.50},
+    "mean_reversion": {"be_r": 0.7, "lock_r": 1.1, "lock_gain_r": 0.25},
+    "reversal_pa": {"be_r": 1.0, "lock_r": 1.5, "lock_gain_r": 0.35},
+    "orderflow_proxy": {"be_r": 0.9, "lock_r": 1.4, "lock_gain_r": 0.40},
+    "session_scalp": {"be_r": 0.7, "lock_r": 1.0, "lock_gain_r": 0.20},
+}
 
 
 def send(obj):
@@ -365,7 +375,7 @@ def mode_open_sides(cfg, mode_id):
 
 
 def manage_mode2_break_even(cfg):
-    """Move SL to BE(+buffer) for Mode 2 positions once price reaches >=1R."""
+    """Dynamic BE/lock management for Mode 2 strategy positions."""
     if mt5 is None:
         return
     mode_id = MODE_SCALP_M1_2
@@ -402,14 +412,33 @@ def manage_mode2_break_even(cfg):
                 init_risk = abs(entry - sl_cur)
             if init_risk <= 0:
                 continue
-            _mode2_be_cache[ticket] = {"init_risk": init_risk, "be_done": bool(st.get("be_done", False))}
+            st_stage = str(st.get("stage", "init"))
+            _mode2_be_cache[ticket] = {"init_risk": init_risk, "stage": st_stage}
 
             move = (bid - entry) if side == "BUY" else (entry - ask)
-            if move < init_risk * 1.0:
+            if move <= 0:
                 continue
 
-            be_lock = max(0.08 * init_risk, min_stop_dist * 1.1, point * 8.0)
-            new_sl = (entry + be_lock) if side == "BUY" else (entry - be_lock)
+            rules = MODE2_BE_RULES.get(sid, {"be_r": 1.0, "lock_r": 1.5, "lock_gain_r": 0.30})
+            move_r = move / max(1e-9, init_risk)
+            spread = max(0.0, ask - bid)
+            be_lock = max(0.08 * init_risk, min_stop_dist * 1.1, spread * 1.5, point * 8.0)
+
+            target_stage = None
+            if move_r >= float(rules.get("lock_r", 1.5)):
+                lock_gain_r = max(0.05, float(rules.get("lock_gain_r", 0.30)))
+                lock_gain = lock_gain_r * init_risk
+                new_sl = (entry + lock_gain) if side == "BUY" else (entry - lock_gain)
+                target_stage = "lock"
+            elif move_r >= float(rules.get("be_r", 1.0)):
+                new_sl = (entry + be_lock) if side == "BUY" else (entry - be_lock)
+                target_stage = "be"
+            else:
+                continue
+
+            # Don't downgrade stage (e.g., lock -> be).
+            if st_stage == "lock" and target_stage != "lock":
+                continue
 
             if side == "BUY":
                 max_allowed = bid - max(min_stop_dist * 1.05, point * 2.0)
@@ -435,10 +464,11 @@ def manage_mode2_break_even(cfg):
             if res is None or getattr(res, "retcode", None) != mt5.TRADE_RETCODE_DONE:
                 continue
 
-            _mode2_be_cache[ticket] = {"init_risk": init_risk, "be_done": True}
+            _mode2_be_cache[ticket] = {"init_risk": init_risk, "stage": target_stage}
             log(
-                f"[Mode 2 - BE/{MODE2_STRATEGY_LABELS.get(sid, sid)}] ticket={ticket} {side} vol={vol:.2f} "
-                f"move={move:.2f} (>=1R {init_risk:.2f}) | SL {sl_cur:.2f} -> {new_sl:.2f}",
+                f"[Mode 2 - {target_stage.upper()}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] "
+                f"ticket={ticket} {side} vol={vol:.2f} move={move:.2f} ({move_r:.2f}R) "
+                f"| SL {sl_cur:.2f} -> {new_sl:.2f}",
                 "info",
             )
         except Exception:
