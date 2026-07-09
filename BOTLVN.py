@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-09-mode2-be-matrix-v20"
+BOT_BUILD = "2026-07-09-mode2-tp1-partial-v21"
 MODE2_MEAN_REV_LOCK_MINUTES = 90
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
@@ -375,7 +375,7 @@ def mode_open_sides(cfg, mode_id):
 
 
 def manage_mode2_break_even(cfg):
-    """Dynamic BE/lock management for Mode 2 strategy positions."""
+    """Dynamic TP1 partial + BE/lock management for Mode 2 positions."""
     if mt5 is None:
         return
     mode_id = MODE_SCALP_M1_2
@@ -392,11 +392,13 @@ def manage_mode2_break_even(cfg):
     ask = float(getattr(tick, "ask", 0.0) or 0.0)
     bid = float(getattr(tick, "bid", 0.0) or 0.0)
 
+    active_tickets = set()
     for p in positions:
         try:
             ticket = int(getattr(p, "ticket", 0) or 0)
             if ticket <= 0:
                 continue
+            active_tickets.add(ticket)
             side = "BUY" if int(getattr(p, "type", -1)) == int(mt5.POSITION_TYPE_BUY) else "SELL"
             entry = float(getattr(p, "price_open", 0.0) or 0.0)
             sl_cur = float(getattr(p, "sl", 0.0) or 0.0)
@@ -413,11 +415,65 @@ def manage_mode2_break_even(cfg):
             if init_risk <= 0:
                 continue
             st_stage = str(st.get("stage", "init"))
-            _mode2_be_cache[ticket] = {"init_risk": init_risk, "stage": st_stage}
+            tp1 = float(st.get("tp1", 0.0) or 0.0)
+            tp1_done = bool(st.get("tp1_done", False))
+            if tp1 <= 0:
+                tp1 = entry + init_risk if side == "BUY" else entry - init_risk
+            _mode2_be_cache[ticket] = {
+                "init_risk": init_risk,
+                "stage": st_stage,
+                "tp1": tp1,
+                "tp1_done": tp1_done,
+            }
 
             move = (bid - entry) if side == "BUY" else (entry - ask)
             if move <= 0:
                 continue
+
+            # 1) Expert-style partial at TP1 (close 50% of volume once).
+            if not tp1_done:
+                tp1_hit = (bid >= tp1) if side == "BUY" else (ask <= tp1)
+                if tp1_hit:
+                    vol_min = float(getattr(info, "volume_min", 0.01) or 0.01)
+                    close_vol = round_lot(vol * 0.5, info)
+                    if close_vol >= vol:
+                        close_vol = round_lot(max(vol_min, vol - vol_min), info)
+                    if close_vol >= vol_min and close_vol < vol:
+                        close_req = {
+                            "action": mt5.TRADE_ACTION_DEAL,
+                            "symbol": cfg["symbol"],
+                            "position": ticket,
+                            "volume": close_vol,
+                            "type": mt5.ORDER_TYPE_SELL if side == "BUY" else mt5.ORDER_TYPE_BUY,
+                            "price": bid if side == "BUY" else ask,
+                            "deviation": int(cfg.get("deviation", 25)),
+                            "magic": int(getattr(p, "magic", 0) or 0),
+                            "comment": "EGSTP1",
+                            "type_time": mt5.ORDER_TIME_GTC,
+                        }
+                        fill_modes = [int(getattr(info, "filling_mode", -1)), mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
+                        sent = False
+                        for fm in fill_modes:
+                            if not isinstance(fm, int) or fm < 0:
+                                continue
+                            close_req["type_filling"] = fm
+                            res = mt5.order_send(close_req)
+                            if res is not None and getattr(res, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+                                sent = True
+                                break
+                        if sent:
+                            tp1_done = True
+                            _mode2_be_cache[ticket] = {
+                                "init_risk": init_risk,
+                                "stage": st_stage,
+                                "tp1": tp1,
+                                "tp1_done": True,
+                            }
+                            log(
+                                f"[Mode 2 - TP1/{MODE2_STRATEGY_LABELS.get(sid, sid)}] ticket={ticket} {side} "
+                                f"close50%={close_vol:.2f}/{vol:.2f} @tp1={tp1:.2f}",
+                                "info",
+                            )
 
             rules = MODE2_BE_RULES.get(sid, {"be_r": 1.0, "lock_r": 1.5, "lock_gain_r": 0.30})
             move_r = move / max(1e-9, init_risk)
@@ -464,7 +520,12 @@ def manage_mode2_break_even(cfg):
             if res is None or getattr(res, "retcode", None) != mt5.TRADE_RETCODE_DONE:
                 continue
 
-            _mode2_be_cache[ticket] = {"init_risk": init_risk, "stage": target_stage}
+            _mode2_be_cache[ticket] = {
+                "init_risk": init_risk,
+                "stage": target_stage,
+                "tp1": tp1,
+                "tp1_done": tp1_done,
+            }
             log(
                 f"[Mode 2 - {target_stage.upper()}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] "
                 f"ticket={ticket} {side} vol={vol:.2f} move={move:.2f} ({move_r:.2f}R) "
@@ -473,6 +534,11 @@ def manage_mode2_break_even(cfg):
             )
         except Exception:
             continue
+
+    # Cleanup stale cache entries from closed positions.
+    stale = [k for k in _mode2_be_cache.keys() if k not in active_tickets]
+    for k in stale:
+        _mode2_be_cache.pop(k, None)
 
 
 def normalize_mode_settings(cfg):
@@ -2198,6 +2264,21 @@ def open_trade(cfg, side, signal):
 
     if res is None or getattr(res, "retcode", None) != mt5.TRADE_RETCODE_DONE:
         return False, "order_send failed | " + " | ".join(attempts[-3:])
+
+    # Cache TP1/initial risk for Mode 2 post-entry management (TP1 partial + BE/LOCK).
+    try:
+        if mode_id == MODE_SCALP_M1_2:
+            pos_ticket = int(getattr(res, "order", 0) or 0)
+            s_tp1 = signal.get("tp1")
+            if pos_ticket > 0 and isinstance(s_tp1, (int, float)):
+                _mode2_be_cache[pos_ticket] = {
+                    "init_risk": float(stop_dist),
+                    "stage": "init",
+                    "tp1": float(s_tp1),
+                    "tp1_done": False,
+                }
+    except Exception:
+        pass
 
     send(
         {
