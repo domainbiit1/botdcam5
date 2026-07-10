@@ -81,6 +81,8 @@ class App(tk.Tk):
         self.all_services = []
         self.orders = {}  # order_id -> dict
         self.polling_enabled = True
+        self.country_refresh_after = None
+        self.connected_var = tk.StringVar(value="Disconnected")
 
         self._init_style()
         self._build_ui()
@@ -95,6 +97,7 @@ class App(tk.Tk):
         style.configure("Sub.TLabel", background="#ffffff", font=("Segoe UI", 10), foreground="#475569")
         style.configure("Small.TLabel", background="#ffffff", font=("Segoe UI", 9), foreground="#64748b")
         style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        style.configure("Muted.TButton", font=("Segoe UI", 9))
         self.configure(bg="#f5f7fb")
 
     def _build_ui(self):
@@ -106,7 +109,9 @@ class App(tk.Tk):
         ttk.Label(top, text="API Key", style="Small.TLabel").pack(side="left", padx=(0, 8))
         self.api_key_entry = ttk.Entry(top, width=70, show="*")
         self.api_key_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(top, text="Set API Key", command=self.set_api_key, style="Accent.TButton").pack(side="left", padx=(8, 0))
+        self.api_key_entry.bind("<Return>", lambda _e: self.set_api_key())
+        ttk.Button(top, text="Connect", command=self.set_api_key, style="Accent.TButton").pack(side="left", padx=(8, 0))
+        ttk.Label(top, textvariable=self.connected_var, style="Sub.TLabel").pack(side="left", padx=(12, 0))
 
         body = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
         body.pack(fill="both", expand=True)
@@ -135,14 +140,17 @@ class App(tk.Tk):
         self.country_entry.insert(0, "187")
         self.country_entry.pack(side="left", padx=(8, 0))
         self.country_entry.bind("<Return>", lambda _e: self.refresh_services())
+        self.country_entry.bind("<KeyRelease>", self._debounced_country_refresh)
 
         search_row = ttk.Frame(parent, style="Card.TFrame")
         search_row.pack(fill="x", pady=(0, 10))
         self.search_entry = ttk.Entry(search_row)
         self.search_entry.insert(0, "Search service...")
         self.search_entry.pack(side="left", fill="x", expand=True)
+        self.search_entry.bind("<FocusIn>", self._clear_search_placeholder)
+        self.search_entry.bind("<FocusOut>", self._restore_search_placeholder)
         self.search_entry.bind("<KeyRelease>", lambda _e: self.apply_service_filter())
-        ttk.Button(search_row, text="Refresh", command=self.refresh_services).pack(side="left", padx=(8, 0))
+        ttk.Button(search_row, text="Reload", command=self.refresh_services, style="Muted.TButton").pack(side="left", padx=(8, 0))
 
         cols = ("service", "price")
         self.service_tree = ttk.Treeview(parent, columns=cols, show="headings", height=20)
@@ -163,18 +171,27 @@ class App(tk.Tk):
 
         controls = ttk.Frame(parent, style="Card.TFrame")
         controls.pack(fill="x", pady=(10, 8))
-        ttk.Label(controls, text="Max Price", style="Small.TLabel").pack(side="left")
-        self.max_price_entry = ttk.Entry(controls, width=10)
-        self.max_price_entry.pack(side="left", padx=(6, 12))
-        ttk.Label(controls, text="Operator", style="Small.TLabel").pack(side="left")
-        self.operator_entry = ttk.Entry(controls, width=14)
-        self.operator_entry.pack(side="left", padx=(6, 12))
         ttk.Button(controls, text="Rent Selected Service", command=self.rent_selected_service, style="Accent.TButton").pack(side="left")
-        ttk.Button(controls, text="Cancel Selected", command=self.cancel_selected_order).pack(side="left", padx=(8, 0))
-        ttk.Button(controls, text="Complete Selected", command=self.complete_selected_order).pack(side="left", padx=(8, 0))
-        ttk.Button(controls, text="Check Now", command=self.check_all_statuses).pack(side="left", padx=(8, 0))
+        ttk.Button(controls, text="Refresh Now", command=self.check_all_statuses, style="Muted.TButton").pack(side="left", padx=(8, 0))
+        self.show_advanced_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            controls,
+            text="Advanced",
+            variable=self.show_advanced_var,
+            command=self._toggle_advanced_controls,
+        ).pack(side="right")
 
-        cols = ("id", "service", "phone", "code", "cost", "status", "actions")
+        self.advanced_row = ttk.Frame(parent, style="Card.TFrame")
+        self.advanced_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(self.advanced_row, text="Max Price", style="Small.TLabel").pack(side="left")
+        self.max_price_entry = ttk.Entry(self.advanced_row, width=10)
+        self.max_price_entry.pack(side="left", padx=(6, 12))
+        ttk.Label(self.advanced_row, text="Operator", style="Small.TLabel").pack(side="left")
+        self.operator_entry = ttk.Entry(self.advanced_row, width=14)
+        self.operator_entry.pack(side="left", padx=(6, 12))
+        self._toggle_advanced_controls()
+
+        cols = ("id", "service", "phone", "code", "cost", "status")
         self.orders_tree = ttk.Treeview(parent, columns=cols, show="headings", height=16)
         headings = {
             "id": "ID",
@@ -183,13 +200,19 @@ class App(tk.Tk):
             "code": "CODE",
             "cost": "COST",
             "status": "STATUS",
-            "actions": "ACTIONS",
         }
-        widths = {"id": 90, "service": 180, "phone": 130, "code": 100, "cost": 90, "status": 200, "actions": 110}
+        widths = {"id": 90, "service": 190, "phone": 135, "code": 110, "cost": 90, "status": 240}
         for c in cols:
             self.orders_tree.heading(c, text=headings[c])
             self.orders_tree.column(c, width=widths[c], anchor="w")
         self.orders_tree.pack(fill="both", expand=True)
+        self.orders_tree.tag_configure("ok", background="#ecfdf3")
+        self.orders_tree.tag_configure("wait", background="#fffdf0")
+        self.orders_tree.tag_configure("error", background="#fef2f2")
+        self.orders_tree.bind("<Button-3>", self._show_order_context_menu)
+        self._order_menu = tk.Menu(self, tearoff=0)
+        self._order_menu.add_command(label="Cancel selected", command=self.cancel_selected_order)
+        self._order_menu.add_command(label="Complete selected", command=self.complete_selected_order)
 
         log_box = ttk.LabelFrame(parent, text="Logs", padding=8)
         log_box.pack(fill="both", expand=True, pady=(10, 0))
@@ -203,6 +226,32 @@ class App(tk.Tk):
         self.log_text.insert("end", f"{message}\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _debounced_country_refresh(self, _event=None):
+        if self.country_refresh_after is not None:
+            self.after_cancel(self.country_refresh_after)
+        self.country_refresh_after = self.after(500, self.refresh_services)
+
+    def _toggle_advanced_controls(self):
+        if bool(self.show_advanced_var.get()):
+            self.advanced_row.pack(fill="x", pady=(0, 8))
+        else:
+            self.advanced_row.pack_forget()
+
+    def _clear_search_placeholder(self, _event=None):
+        if self.search_entry.get().strip().lower() == "search service...":
+            self.search_entry.delete(0, "end")
+
+    def _restore_search_placeholder(self, _event=None):
+        if not self.search_entry.get().strip():
+            self.search_entry.insert(0, "Search service...")
+
+    def _show_order_context_menu(self, event):
+        row_id = self.orders_tree.identify_row(event.y)
+        if row_id:
+            self.orders_tree.selection_set(row_id)
+            self._order_menu.tk_popup(event.x_root, event.y_root)
+            self._order_menu.grab_release()
 
     def _run_bg(self, fn, on_done):
         def worker():
@@ -237,7 +286,8 @@ class App(tk.Tk):
             messagebox.showwarning("Missing API key", "Please enter API key.")
             return
         self.api = LegitSMSApi(key)
-        self.log("API key set.")
+        self.connected_var.set("Connected")
+        self.log("Connected. Loading services...")
         self.refresh_services()
 
     def refresh_services(self):
@@ -283,6 +333,8 @@ class App(tk.Tk):
 
     def apply_service_filter(self):
         q = self.search_entry.get().strip().lower()
+        if q == "search service...":
+            q = ""
         items = [x for x in self.all_services if q in x["label"].lower()] if q else list(self.all_services)
         self.filtered_services = items
         for it in self.service_tree.get_children():
@@ -339,12 +391,18 @@ class App(tk.Tk):
             order.get("code", "-"),
             order.get("cost", "-"),
             order.get("status", "-"),
-            "Cancel / Done",
         )
+        status_text = str(order.get("status", ""))
+        tags = ("wait",)
+        if status_text.startswith("STATUS_OK:"):
+            tags = ("ok",)
+        elif status_text.startswith("ERROR") or status_text.startswith("HTTP_ERROR") or status_text.startswith("NO_ACTIVATION"):
+            tags = ("error",)
+
         if self.orders_tree.exists(oid):
-            self.orders_tree.item(oid, values=values)
+            self.orders_tree.item(oid, values=values, tags=tags)
         else:
-            self.orders_tree.insert("", "end", iid=oid, values=values)
+            self.orders_tree.insert("", "end", iid=oid, values=values, tags=tags)
         self.counter_var.set(f"{len(self.orders)} / 5")
 
     def rent_selected_service(self):
@@ -426,6 +484,12 @@ class App(tk.Tk):
                 self.orders[order_id]["status"] = resp
                 self.orders[order_id]["code"] = self._extract_code(resp)
                 self._upsert_order_row(self.orders[order_id])
+                if resp.startswith("STATUS_OK:"):
+                    try:
+                        self.clipboard_clear()
+                        self.clipboard_append(self.orders[order_id]["code"])
+                    except Exception:
+                        pass
             self.log(f"getStatus({order_id}) => {resp}")
 
         self._run_bg(task, done)
