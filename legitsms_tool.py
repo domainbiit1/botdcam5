@@ -120,6 +120,7 @@ class MainWindow(QMainWindow):
         self.ui_timer = QTimer(self)
         self.ui_timer.timeout.connect(self._tick_order_countdowns)
         self.ui_timer.start(1000)
+        self._refund_blink_on = False
 
         self._build_ui()
         self._apply_hacker_theme()
@@ -497,6 +498,7 @@ class MainWindow(QMainWindow):
     def _tick_order_countdowns(self):
         if not self.orders:
             return
+        self._refund_blink_on = not self._refund_blink_on
         for order in self.orders.values():
             self._upsert_order_row(order)
         self._update_action_buttons()
@@ -507,8 +509,10 @@ class MainWindow(QMainWindow):
         self.complete_btn.setEnabled(bool(order))
         self.refund_btn.setEnabled(self._can_refund(order) if order else False)
 
-    def _paint_order_row(self, row_index: int, status_text: str):
-        if status_text.startswith("STATUS_OK:"):
+    def _paint_order_row(self, row_index: int, status_text: str, order=None):
+        if order is not None and self._can_refund(order):
+            color = QColor("#2f4a12") if self._refund_blink_on else QColor("#4d2f09")
+        elif status_text.startswith("STATUS_OK:"):
             color = QColor("#12331e")
         elif status_text.startswith("ERROR") or status_text.startswith("HTTP_ERROR") or status_text.startswith("NO_ACTIVATION"):
             color = QColor("#3b1b1b")
@@ -545,7 +549,7 @@ class MainWindow(QMainWindow):
             else:
                 item.setText(value)
 
-        self._paint_order_row(row, values[5])
+        self._paint_order_row(row, values[5], order)
         self.counter_label.setText(f"{len(self.orders)} / 5")
 
     def rent_selected_service(self):
