@@ -85,7 +85,7 @@ if _WORKER_MODE:
 
 _stop = threading.Event()
 _send_lock = threading.Lock()
-BOT_BUILD = "2026-07-09-mode3-dca-m5-v24"
+BOT_BUILD = "2026-07-10-mode2-behavior-diaglog-v25"
 MODE2_MEAN_REV_LOCK_MINUTES = 90
 
 MODE_LVN_1 = "mode1_lvn_adaptive"
@@ -136,6 +136,22 @@ MODE2_MIN_SCORE = 0
 MODE2_RR_MIN = 1.2
 MODE2_SL_MAX = 6.0
 MODE2_SETUP_LOCK_MINUTES = 45
+# v25 behavior tuning:
+# TP1 partial is only taken at >= MODE2_TP1_MIN_R and closes a smaller fraction,
+# so the runner half can actually reach TP2 (old behavior capped winners at ~0.55R).
+MODE2_TP1_MIN_R = 1.25
+MODE2_TP1_CLOSE_FRAC = 0.40
+# Block ALL mode2 entries on extreme volume spike candles (news-like bars).
+MODE2_VOL_SPIKE_BLOCK = 3.0
+# Range-edge veto: when the 12-bar box is narrow, forbid trend-following
+# entries at the wrong edge of the box (sell-at-support / buy-at-resistance).
+MODE2_RANGE_BOUND_ATR = 3.0
+MODE2_RANGE_EDGE_PCT = 0.35
+# Orderflow anti-chase: entry candle must still be near the broken level.
+MODE2_CHOCH_MAX_CHASE_ATR = 0.6
+# Global mode2 circuit breaker: N consecutive losses (any strategy) -> pause.
+MODE2_GLOBAL_LOCK_LOSSES = 3
+MODE2_GLOBAL_LOCK_MINUTES = 60
 MODE3_DCA_MAX_LAYERS = 3
 MODE3_DCA_SPACING_ATR = (0.7, 0.9)
 MODE3_DCA_LOT_FACTORS = (1.0, 1.3, 1.6)
@@ -144,19 +160,27 @@ MODE3_DCA_BASKET_TP_PCT = 1.0
 
 _today_mode_cache = {}
 _setup_lock_cache = {}
+_global_lock_cache = {}
 _closed_deal_log_cache = {}
 _mode2_be_cache = {}
 _mode3_dca_cache = {}
 _mode2_market_diag_cache = {}
+# ticket -> strategy id, survives broker rewriting the position comment
+# after partial closes (which used to break per-strategy attribution).
+_ticket_strategy_cache = {}
+# ticket -> trade journal (entry context snapshot + live MFE/MAE tracking)
+# used to emit rich [ENTRY]/[CLOSE] diagnostics.
+_trade_journal = {}
 MODE2_BE_RULES = {
     # be_r: move to BE+buffer at this R
     # lock_r / lock_gain_r: lock profit at this R (SL = entry +/- lock_gain_r * R)
-    "trend_pullback": {"be_r": 0.9, "lock_r": 1.4, "lock_gain_r": 0.30},
-    "breakout": {"be_r": 1.2, "lock_r": 1.8, "lock_gain_r": 0.50},
-    "mean_reversion": {"be_r": 0.7, "lock_r": 1.1, "lock_gain_r": 0.25},
-    "reversal_pa": {"be_r": 1.0, "lock_r": 1.5, "lock_gain_r": 0.35},
-    "orderflow_proxy": {"be_r": 0.9, "lock_r": 1.4, "lock_gain_r": 0.40},
-    "session_scalp": {"be_r": 0.7, "lock_r": 1.0, "lock_gain_r": 0.20},
+    # v25: BE moved later (>= ~1.1R) so the runner is not strangled at entry.
+    "trend_pullback": {"be_r": 1.15, "lock_r": 1.6, "lock_gain_r": 0.35},
+    "breakout": {"be_r": 1.3, "lock_r": 1.9, "lock_gain_r": 0.55},
+    "mean_reversion": {"be_r": 0.95, "lock_r": 1.3, "lock_gain_r": 0.30},
+    "reversal_pa": {"be_r": 1.15, "lock_r": 1.6, "lock_gain_r": 0.40},
+    "orderflow_proxy": {"be_r": 1.15, "lock_r": 1.6, "lock_gain_r": 0.45},
+    "session_scalp": {"be_r": 0.9, "lock_r": 1.2, "lock_gain_r": 0.25},
 }
 
 
@@ -382,6 +406,25 @@ def round_lot(lot, sym):
     return max(vmin, min(vmax, q))
 
 
+def allowed_filling_modes(info):
+    """Translate symbol_info.filling_mode BITMASK into ORDER_FILLING_* constants.
+
+    Old code passed the bitmask directly as type_filling which produced
+    ret=10030 'Unsupported filling mode' storms and delayed/missed entries.
+    Bitmask: 1 = FOK allowed, 2 = IOC allowed.
+    """
+    mask = int(getattr(info, "filling_mode", 0) or 0)
+    out = []
+    if mask & 2:
+        out.append(int(mt5.ORDER_FILLING_IOC))
+    if mask & 1:
+        out.append(int(mt5.ORDER_FILLING_FOK))
+    for fm in (int(mt5.ORDER_FILLING_IOC), int(mt5.ORDER_FILLING_FOK), int(mt5.ORDER_FILLING_RETURN)):
+        if fm not in out:
+            out.append(fm)
+    return out
+
+
 def mode_magic(cfg, mode):
     base = int(cfg.get("magic", 700100))
     return base + int(MODE_MAGIC_OFFSETS.get(mode, 0))
@@ -437,13 +480,32 @@ def strategy_id_from_comment(comment, mode_id):
     return None
 
 
+def strategy_id_for_position(pos_or_ticket, mode_id, comment=None):
+    """Resolve the strategy id of a position robustly.
+
+    Brokers often rewrite the position comment after a partial close, which
+    breaks comment parsing (log showed '[Mode 2 - BE/-]'). We therefore fall
+    back to the ticket->strategy cache written at open time.
+    """
+    if hasattr(pos_or_ticket, "ticket"):
+        ticket = int(getattr(pos_or_ticket, "ticket", 0) or 0)
+        c = comment if comment is not None else getattr(pos_or_ticket, "comment", "")
+    else:
+        ticket = int(pos_or_ticket or 0)
+        c = comment
+    sid = strategy_id_from_comment(c, mode_id)
+    if sid:
+        return sid
+    return _ticket_strategy_cache.get(ticket)
+
+
 def count_strategy_positions(cfg, mode_id, strategy_id):
     if not strategy_id:
         return 0
     pos = my_positions(cfg, mode_id)
     out = 0
     for p in pos:
-        sid = strategy_id_from_comment(getattr(p, "comment", ""), mode_id)
+        sid = strategy_id_for_position(p, mode_id)
         if sid == strategy_id:
             out += 1
     return out
@@ -464,13 +526,27 @@ def is_setup_temporarily_locked(cfg, mode_id, strategy_id, lock_minutes=45, min_
             _setup_lock_cache[key] = {"t": now, "locked": False, "losses": 0, "remaining_sec": 0}
             return False, 0, 0
         magic = int(mode_magic(cfg, mode_id))
+        # v25 fix: OUT deals from SL carry broker comments like "[sl 4095.745]",
+        # never our strategy tag, so the old comment-based attribution NEVER
+        # matched and this lock was dead code. Attribute via the IN leg instead.
+        in_sid_by_pos = {}
+        for d in deals:
+            if int(getattr(d, "magic", 0)) != magic:
+                continue
+            if int(getattr(d, "entry", -1)) != int(mt5.DEAL_ENTRY_IN):
+                continue
+            pos_id = int(getattr(d, "position_id", 0) or 0)
+            if pos_id <= 0:
+                continue
+            in_sid_by_pos[pos_id] = strategy_id_for_position(pos_id, mode_id, comment=getattr(d, "comment", ""))
         rows = []
         for d in deals:
             if int(getattr(d, "magic", 0)) != magic:
                 continue
             if int(getattr(d, "entry", -1)) != int(mt5.DEAL_ENTRY_OUT):
                 continue
-            sid = strategy_id_from_comment(getattr(d, "comment", ""), mode_id)
+            pos_id = int(getattr(d, "position_id", 0) or 0)
+            sid = in_sid_by_pos.get(pos_id) or strategy_id_from_comment(getattr(d, "comment", ""), mode_id)
             if sid != strategy_id:
                 continue
             pnl = float(getattr(d, "profit", 0.0) or 0.0) + float(getattr(d, "swap", 0.0) or 0.0) + float(getattr(d, "commission", 0.0) or 0.0)
@@ -498,6 +574,109 @@ def is_setup_temporarily_locked(cfg, mode_id, strategy_id, lock_minutes=45, min_
     except Exception:
         _setup_lock_cache[key] = {"t": now, "locked": False, "losses": 0, "remaining_sec": 0}
         return False, 0, 0
+
+
+def is_mode2_globally_locked(cfg, max_losses=MODE2_GLOBAL_LOCK_LOSSES, lock_minutes=MODE2_GLOBAL_LOCK_MINUTES):
+    """Circuit breaker across ALL mode2 strategies.
+
+    The per-setup lock never triggered when losses alternated between
+    strategies. This lock counts trailing consecutive losing closes for the
+    whole mode2 magic and pauses new entries for lock_minutes.
+    Returns (locked, consecutive_losses, remaining_sec).
+    """
+    now = time.time()
+    key = (id(cfg), "mode2-global", int(max_losses), int(lock_minutes))
+    cached = _global_lock_cache.get(key)
+    if cached and now - float(cached.get("t", 0.0)) < 10.0:
+        return bool(cached.get("locked", False)), int(cached.get("losses", 0)), int(cached.get("remaining_sec", 0))
+    try:
+        start = datetime.combine(datetime.now().date(), datetime.min.time())
+        deals = mt5.history_deals_get(start, datetime.now())
+        if deals is None:
+            _global_lock_cache[key] = {"t": now, "locked": False, "losses": 0, "remaining_sec": 0}
+            return False, 0, 0
+        magic = int(mode_magic(cfg, MODE_SCALP_M1_2))
+        rows = []
+        for d in deals:
+            if int(getattr(d, "magic", 0)) != magic:
+                continue
+            if int(getattr(d, "entry", -1)) != int(mt5.DEAL_ENTRY_OUT):
+                continue
+            pnl = float(getattr(d, "profit", 0.0) or 0.0) + float(getattr(d, "swap", 0.0) or 0.0) + float(getattr(d, "commission", 0.0) or 0.0)
+            rows.append((int(getattr(d, "time", 0)), pnl))
+        rows.sort(key=lambda x: x[0])
+        losses = 0
+        last_loss_ts = 0
+        for ts, pnl in reversed(rows):
+            if pnl < 0:
+                losses += 1
+                if last_loss_ts == 0:
+                    last_loss_ts = ts
+            else:
+                break
+        locked = False
+        remaining_sec = 0
+        if losses >= int(max_losses) and last_loss_ts > 0:
+            lock_total = float(lock_minutes) * 60.0
+            elapsed = now - float(last_loss_ts)
+            locked = elapsed <= lock_total
+            if locked:
+                remaining_sec = max(0, int(lock_total - elapsed))
+        _global_lock_cache[key] = {"t": now, "locked": locked, "losses": losses, "remaining_sec": remaining_sec}
+        return locked, losses, remaining_sec
+    except Exception:
+        _global_lock_cache[key] = {"t": now, "locked": False, "losses": 0, "remaining_sec": 0}
+        return False, 0, 0
+
+
+def update_trade_journal(cfg):
+    """Track live MFE/MAE (in R) for every open bot position.
+
+    This makes post-mortems from logs possible: at close time we can tell
+    whether a losing trade never worked (mae immediately) or gave profit
+    first (mfe high) and was managed badly.
+    """
+    if mt5 is None:
+        return
+    tick = mt5.symbol_info_tick(cfg["symbol"])
+    if tick is None:
+        return
+    ask = float(getattr(tick, "ask", 0.0) or 0.0)
+    bid = float(getattr(tick, "bid", 0.0) or 0.0)
+    if ask <= 0 or bid <= 0:
+        return
+    for p in account_positions_all_modes(cfg):
+        ticket = int(getattr(p, "ticket", 0) or 0)
+        if ticket <= 0:
+            continue
+        side = "BUY" if int(getattr(p, "type", -1)) == int(mt5.POSITION_TYPE_BUY) else "SELL"
+        entry = float(getattr(p, "price_open", 0.0) or 0.0)
+        sl = float(getattr(p, "sl", 0.0) or 0.0)
+        j = _trade_journal.get(ticket)
+        if j is None:
+            init_risk = abs(entry - sl) if sl > 0 else 0.0
+            j = {
+                "mode": None,
+                "sid": _ticket_strategy_cache.get(ticket),
+                "side": side,
+                "entry": entry,
+                "sl0": sl,
+                "init_risk": init_risk,
+                "open_ts": float(getattr(p, "time", 0) or time.time()),
+                "mfe_r": 0.0,
+                "mae_r": 0.0,
+                "ctx": "",
+            }
+            _trade_journal[ticket] = j
+        init_risk = float(j.get("init_risk", 0.0) or 0.0)
+        if init_risk <= 0:
+            continue
+        move = (bid - entry) if side == "BUY" else (entry - ask)
+        move_r = move / init_risk
+        if move_r > float(j.get("mfe_r", 0.0)):
+            j["mfe_r"] = float(move_r)
+        if move_r < float(j.get("mae_r", 0.0)):
+            j["mae_r"] = float(move_r)
 
 
 def mode_open_sides(cfg, mode_id):
@@ -542,7 +721,7 @@ def manage_mode2_break_even(cfg):
             sl_cur = float(getattr(p, "sl", 0.0) or 0.0)
             tp_cur = float(getattr(p, "tp", 0.0) or 0.0)
             vol = float(getattr(p, "volume", 0.0) or 0.0)
-            sid = strategy_id_from_comment(getattr(p, "comment", ""), mode_id) or "-"
+            sid = strategy_id_for_position(p, mode_id) or "-"
             if entry <= 0 or sl_cur <= 0:
                 continue
 
@@ -565,6 +744,10 @@ def manage_mode2_break_even(cfg):
             tp1_done = bool(st.get("tp1_done", False))
             if tp1 <= 0:
                 tp1 = entry + init_risk if side == "BUY" else entry - init_risk
+            # v25: never take the partial before MODE2_TP1_MIN_R, otherwise
+            # winners get capped near 1R while losers pay the full stop.
+            tp1_min = entry + MODE2_TP1_MIN_R * init_risk if side == "BUY" else entry - MODE2_TP1_MIN_R * init_risk
+            tp1 = max(tp1, tp1_min) if side == "BUY" else min(tp1, tp1_min)
             st["init_risk"] = init_risk
             st["stage"] = st_stage
             st["tp1"] = tp1
@@ -574,12 +757,12 @@ def manage_mode2_break_even(cfg):
             if move <= 0:
                 continue
 
-            # 1) Expert-style partial at TP1 (close 50% of volume once).
+            # 1) Partial at TP1 (>=1.25R): close MODE2_TP1_CLOSE_FRAC of volume once.
             if not tp1_done:
                 tp1_hit = (bid >= tp1) if side == "BUY" else (ask <= tp1)
                 if tp1_hit:
                     vol_min = float(getattr(info, "volume_min", 0.01) or 0.01)
-                    close_vol = round_lot(vol * 0.5, info)
+                    close_vol = round_lot(vol * float(MODE2_TP1_CLOSE_FRAC), info)
                     if close_vol >= vol:
                         close_vol = round_lot(max(vol_min, vol - vol_min), info)
                     if close_vol >= vol_min and close_vol < vol:
@@ -595,11 +778,8 @@ def manage_mode2_break_even(cfg):
                             "comment": "EGSTP1",
                             "type_time": mt5.ORDER_TIME_GTC,
                         }
-                        fill_modes = [int(getattr(info, "filling_mode", -1)), mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
                         sent = False
-                        for fm in fill_modes:
-                            if not isinstance(fm, int) or fm < 0:
-                                continue
+                        for fm in allowed_filling_modes(info):
                             close_req["type_filling"] = fm
                             res = mt5.order_send(close_req)
                             if res is not None and getattr(res, "retcode", None) == mt5.TRADE_RETCODE_DONE:
@@ -610,9 +790,11 @@ def manage_mode2_break_even(cfg):
                             st["tp1_done"] = True
                             st["last_diag_key"] = ""
                             st["last_diag_t"] = 0.0
+                            tp1_r = abs(tp1 - entry) / max(1e-9, init_risk)
                             log(
                                 f"[Mode 2 - TP1/{MODE2_STRATEGY_LABELS.get(sid, sid)}] ticket={ticket} {side} "
-                                f"close50%={close_vol:.2f}/{vol:.2f} @tp1={tp1:.2f}",
+                                f"close{int(MODE2_TP1_CLOSE_FRAC*100)}%={close_vol:.2f}/{vol:.2f} @tp1={tp1:.2f} (+{tp1_r:.2f}R) "
+                                f"| runner={vol - close_vol:.2f} giữ tới TP2",
                                 "info",
                             )
                         else:
@@ -1488,6 +1670,28 @@ def compute_mode2_m1_scalp_signal(cfg):
         and body >= 0.55 * rng
     )
 
+    # v25: position of price inside the 12-bar box (0=bottom, 1=top) and
+    # range-bound flag. Used to veto trend entries at the wrong box edge
+    # (the "sell at range bottom" losses in Asian chop).
+    box_pos = (close - range_l_12) / max(1e-9, range_w_12)
+    box_pos = min(1.0, max(0.0, box_pos))
+    range_bound = range_w_12 <= float(MODE2_RANGE_BOUND_ATR) * a and not (up_impulse or down_impulse)
+
+    def range_edge_veto(sig_side):
+        if not range_bound:
+            return None
+        if sig_side == "SELL" and box_pos <= float(MODE2_RANGE_EDGE_PCT):
+            return (
+                f"[VETO range-edge] SELL sát đáy hộp 12 nến "
+                f"(box_pos={box_pos*100:.0f}%, width={range_w_12/max(1e-9,a):.1f}ATR) — dễ bật ngược"
+            )
+        if sig_side == "BUY" and box_pos >= 1.0 - float(MODE2_RANGE_EDGE_PCT):
+            return (
+                f"[VETO range-edge] BUY sát đỉnh hộp 12 nến "
+                f"(box_pos={box_pos*100:.0f}%, width={range_w_12/max(1e-9,a):.1f}ATR) — dễ bật ngược"
+            )
+        return None
+
     mode2_cfg = cfg.get("modes", {}).get(MODE_SCALP_M1_2, {})
     strats = mode2_cfg.get("strategies", {}) if isinstance(mode2_cfg, dict) else {}
     candidates = []
@@ -1536,6 +1740,19 @@ def compute_mode2_m1_scalp_signal(cfg):
         return base
 
     def build_trade(sid, sig_side, entry, sl, tp1, tp2, why, cancel_rule, confidence, priority, confirm_count, lot_factor=1.0):
+        # v25: trend-following strategies must not enter at the hostile edge
+        # of a narrow box (sell-at-support / buy-at-resistance).
+        # NOTE: breakout is exempt — entering at the box edge is its premise.
+        if sid in ("trend_pullback", "orderflow_proxy"):
+            veto = range_edge_veto(sig_side)
+            if veto:
+                set_wait_status(
+                    sid,
+                    f"NO TRADE | {veto}",
+                    buy_h=entry if sig_side == "BUY" else None,
+                    sell_h=entry if sig_side == "SELL" else None,
+                )
+                return
         req_score = required_score(sid)
         if int(confirm_count) < int(req_score):
             set_wait_status(
@@ -1595,7 +1812,7 @@ def compute_mode2_m1_scalp_signal(cfg):
         trade_reason = (
             f"Chiến lược: {MODE2_STRATEGY_LABELS.get(sid, sid)} | Hướng: {sig_side} | Entry:{entry:.2f} "
             f"SL:{sl:.2f} TP1:{tp1:.2f} TP2:{tp2:.2f} RR:{rr:.2f} | Lý do: {why} | Hủy kèo: {cancel_rule} "
-            f"| Quản lý: BE tại 1R, TP1 chốt 50% | Tự tin: {int(confidence)}/10"
+            f"| Quản lý: TP1>= {MODE2_TP1_MIN_R:.2f}R chốt {int(MODE2_TP1_CLOSE_FRAC*100)}%, BE muộn theo setup | Tự tin: {int(confidence)}/10"
         )
         candidates.append(
             {
@@ -1642,6 +1859,10 @@ def compute_mode2_m1_scalp_signal(cfg):
         soft_noise.append("ATR thấp, thiếu biên độ")
     if spike_prev:
         soft_noise.append("Vừa có nến spike lớn chưa retest")
+    # v25: never enter on an extreme volume-spike candle (news-like bar).
+    # The 21:36 loss entered SELL into a 6.38x spike and was stopped in 82s.
+    if vol_ratio >= float(MODE2_VOL_SPIKE_BLOCK):
+        hard_noise.append(f"Volume spike {vol_ratio:.1f}x >= {MODE2_VOL_SPIKE_BLOCK:.1f}x (nến bất thường/tin), đứng ngoài")
     if in_news_blackout(cfg, t_now):
         hard_noise.append("Gần tin mạnh")
     tick = mt5.symbol_info_tick(cfg["symbol"])
@@ -1788,8 +2009,11 @@ def compute_mode2_m1_scalp_signal(cfg):
         vol_boost = (body_strong and vol_now >= 1.00 * vol_avg_base) or (body_ok and vol_now >= vol_mult * vol_avg_base)
         bo_dist_up = close - r_hi
         bo_dist_dn = r_lo - close
-        fake_bo_buy = (high - close) >= 0.55 * rng and bo_dist_up < 0.10 * a
-        fake_bo_sell = (close - low) >= 0.55 * rng and bo_dist_dn < 0.10 * a
+        # v25 fix: only flag "false-break risk" when a breakout attempt actually
+        # exists (price poked past the range). The old check fired on almost
+        # every ordinary candle and silently killed the whole strategy.
+        fake_bo_buy = (close > r_hi - 0.05 * a) and (high - close) >= 0.55 * rng and bo_dist_up < 0.10 * a
+        fake_bo_sell = (close < r_lo + 0.05 * a) and (close - low) >= 0.55 * rng and bo_dist_dn < 0.10 * a
         breakout_follow_buy = close > prev_close and close >= r_hi + 0.05 * a
         breakout_follow_sell = close < prev_close and close <= r_lo - 0.05 * a
         # Break-and-go continuation branch for strong directional markets with shallow pullback.
@@ -1957,8 +2181,19 @@ def compute_mode2_m1_scalp_signal(cfg):
         evening_star = (float(prev2["close"]) > float(prev2["open"])) and (abs(prev_close - prev_open) < 0.4 * a) and close < open_
         bull_follow2 = (prev_close > prev_open) and (close > prev_close) and close > open_
         bear_follow2 = (prev_close < prev_open) and (close < prev_close) and close < open_
-        touch_sup = abs(low - sup_big) <= 0.32 * a or abs(low - support) <= 0.32 * a
-        touch_res = abs(high - res_big) <= 0.32 * a or abs(high - resistance) <= 0.32 * a
+        # v25: also accept the 60-bar M5 extremes as touchable S/R. The old
+        # levels (M15-40/H1-20 extremes) were often 20-30 points away, so this
+        # strategy almost never armed ("sr-not-touch" dominated the summary).
+        touch_sup = (
+            abs(low - sup_big) <= 0.32 * a
+            or abs(low - support) <= 0.32 * a
+            or abs(low - range_lo_60) <= 0.25 * a
+        )
+        touch_res = (
+            abs(high - res_big) <= 0.32 * a
+            or abs(high - resistance) <= 0.32 * a
+            or abs(high - range_hi_60) <= 0.25 * a
+        )
         rev_buy_ok = not (down_impulse and close < ema20.iloc[i] and trend_sell)
         rev_sell_ok = not (up_impulse and close > ema20.iloc[i] and trend_buy)
         if touch_sup and rev_buy_ok and (bullish_engulf or bullish_pin or morning_star or bull_follow2):
@@ -2007,27 +2242,36 @@ def compute_mode2_m1_scalp_signal(cfg):
         choch_dn = (sweep_high and close < micro_lo + 0.05 * a) or (
             close < micro_lo - 0.04 * a and prev_close >= micro_lo - 0.02 * a and body >= 0.38 * rng
         )
+        # v25 anti-chase: the label says "retest vùng phá cấu trúc" so the close
+        # must still be NEAR the broken level, not far past it (the 21:36 loss
+        # sold 7+ points below the break, right into the technical bounce).
+        chase_up = (close - micro_hi) > float(MODE2_CHOCH_MAX_CHASE_ATR) * a
+        chase_dn = (micro_lo - close) > float(MODE2_CHOCH_MAX_CHASE_ATR) * a
+        # v25 room-to-target: never short right into nearby support (or buy
+        # into resistance). Breakout already had this check; CHOCH did not.
+        sell_room_ok = (close - support) > 0.8 * a and (close - sup_big) > 1.0 * a
+        buy_room_ok = (resistance - close) > 0.8 * a and (res_big - close) > 1.0 * a
         flow_buy_ok = (trend_buy or trend_buy_15) and not trend_flat and not (trend_sell and down_impulse)
         flow_sell_ok = (trend_sell or trend_sell_15) and not trend_flat and not (trend_buy and up_impulse)
-        if choch_up and flow_buy_ok:
+        if choch_up and flow_buy_ok and buy_room_ok and not chase_up:
             entry = close
             sl = low - 0.12 * a
             tp1 = swing_hi
             tp2 = min(resistance, entry + 2.0 * abs(entry - sl)) if resistance > entry else entry + 2.0 * abs(entry - sl)
             build_trade("orderflow_proxy", "BUY", entry, sl, tp1, tp2, "quét đáy + CHOCH tăng + retest vùng phá cấu trúc", "Hủy nếu phá xuống dưới đáy quét", 7, 80, 5)
-        elif choch_dn and flow_sell_ok:
+        elif choch_dn and flow_sell_ok and sell_room_ok and not chase_dn:
             entry = close
             sl = high + 0.12 * a
             tp1 = swing_lo
             tp2 = max(support, entry - 2.0 * abs(entry - sl)) if support < entry else entry - 2.0 * abs(entry - sl)
             build_trade("orderflow_proxy", "SELL", entry, sl, tp1, tp2, "quét đỉnh + CHOCH giảm + retest vùng phá cấu trúc", "Hủy nếu phá lên trên đỉnh quét", 7, 80, 5)
-        elif close > micro_hi + 0.10 * a and prev_close <= micro_hi and close > ema20.iloc[i] and vol_ratio >= 1.05 and flow_buy_ok:
+        elif close > micro_hi + 0.10 * a and prev_close <= micro_hi and close > ema20.iloc[i] and vol_ratio >= 1.05 and flow_buy_ok and buy_room_ok and not chase_up:
             entry = close
             sl = min(micro_lo, low) - 0.10 * a
             tp1 = entry + abs(entry - sl)
             tp2 = min(resistance, entry + 1.6 * abs(entry - sl)) if resistance > entry else entry + 1.6 * abs(entry - sl)
             build_trade("orderflow_proxy", "BUY", entry, sl, tp1, tp2, "break micro-structure + volume hỗ trợ", "Hủy nếu đóng lại dưới micro range", 6, 76, 4, 0.8)
-        elif close < micro_lo - 0.10 * a and prev_close >= micro_lo and close < ema20.iloc[i] and vol_ratio >= 1.05 and flow_sell_ok:
+        elif close < micro_lo - 0.10 * a and prev_close >= micro_lo and close < ema20.iloc[i] and vol_ratio >= 1.05 and flow_sell_ok and sell_room_ok and not chase_dn:
             entry = close
             sl = max(micro_hi, high) + 0.10 * a
             tp1 = entry - abs(entry - sl)
@@ -2043,6 +2287,14 @@ def compute_mode2_m1_scalp_signal(cfg):
                 miss.append("thị trường FLAT, bỏ qua Orderflow/CHOCH")
             if not flow_buy_ok or not flow_sell_ok:
                 miss.append("đang có impulse mạnh/không đồng thuận trend")
+            if choch_dn and chase_dn:
+                miss.append(f"[VETO chase] SELL đã chạy quá xa dưới vùng phá ({(micro_lo - close)/max(1e-9,a):.1f}ATR > {MODE2_CHOCH_MAX_CHASE_ATR}ATR), chờ retest")
+            if choch_up and chase_up:
+                miss.append(f"[VETO chase] BUY đã chạy quá xa trên vùng phá ({(close - micro_hi)/max(1e-9,a):.1f}ATR > {MODE2_CHOCH_MAX_CHASE_ATR}ATR), chờ retest")
+            if choch_dn and not sell_room_ok:
+                miss.append(f"[VETO room] SELL quá gần hỗ trợ (dSup={(close - support)/max(1e-9,a):.1f}ATR), không đủ đường chạy")
+            if choch_up and not buy_room_ok:
+                miss.append(f"[VETO room] BUY quá gần kháng cự (dRes={(resistance - close)/max(1e-9,a):.1f}ATR), không đủ đường chạy")
             set_wait_status("orderflow_proxy", why_missing(miss, "NO TRADE | chưa có CHOCH rõ + retest"), buy_h=micro_hi, sell_h=micro_lo)
     else:
         set_wait_status("orderflow_proxy", "disabled")
@@ -2199,6 +2451,20 @@ def compute_mode2_m1_scalp_signal(cfg):
             "range40_atr": float(range_w_40 / max(1e-9, a)),
             "vol_ratio": float(vol_ratio),
             "rsi": float(rsi_now),
+            # v25 diagnostics: where price sits inside the local box and how
+            # far the nearest S/R levels are (in ATR). These make it obvious
+            # from logs WHY an entry location was good or bad.
+            "box12_pos": float(box_pos),
+            "range_bound": bool(range_bound),
+            "trend_m15": "BUY" if trend_buy_15 else ("SELL" if trend_sell_15 else "FLAT"),
+            "trend_h1": "BUY" if trend_buy_h1 else ("SELL" if trend_sell_h1 else "FLAT"),
+            "dist_sup_atr": float((close - support) / max(1e-9, a)),
+            "dist_res_atr": float((resistance - close) / max(1e-9, a)),
+            "dist_sup_big_atr": float((close - sup_big) / max(1e-9, a)),
+            "dist_res_big_atr": float((res_big - close) / max(1e-9, a)),
+            "support": float(support),
+            "resistance": float(resistance),
+            "atr": float(a),
         },
     }
 
@@ -2224,11 +2490,8 @@ def close_position_market(cfg, pos, note="mode-close"):
         "comment": "EGSM3EXIT",
         "type_time": mt5.ORDER_TIME_GTC,
     }
-    fill_modes = [int(getattr(info, "filling_mode", -1)), mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
     last_err = ""
-    for fm in fill_modes:
-        if not isinstance(fm, int) or fm < 0:
-            continue
+    for fm in allowed_filling_modes(info):
         req = dict(req_base)
         req["type_filling"] = fm
         res = mt5.order_send(req)
@@ -2600,8 +2863,10 @@ def log_recent_closed_deals(cfg, lookback_hours=24, started_ts=None):
                 "entry": float(getattr(d, "price", 0.0) or 0.0),
                 "side": side,
                 "comment": str(getattr(d, "comment", "") or ""),
+                "time": int(getattr(d, "time", 0) or 0),
             }
 
+        open_pos_ids = {int(getattr(p, "ticket", 0) or 0) for p in account_positions_all_modes(cfg)}
         now = time.time()
         for d in deals:
             magic = int(getattr(d, "magic", 0) or 0)
@@ -2632,7 +2897,12 @@ def log_recent_closed_deals(cfg, lookback_hours=24, started_ts=None):
                 entry_txt = "-"
             comment = str(getattr(d, "comment", "") or "")
             open_comment = str(in_leg.get("comment", "") or "")
-            sid = strategy_id_from_comment(open_comment or comment, mode_id)
+            journal = _trade_journal.get(pos_id, {})
+            sid = (
+                strategy_id_from_comment(open_comment or comment, mode_id)
+                or journal.get("sid")
+                or _ticket_strategy_cache.get(pos_id)
+            )
             if mode_id == MODE_SCALP_M1_2:
                 strat_label = MODE2_STRATEGY_LABELS.get(sid or "", sid or "-")
             elif mode_id == MODE_DCA_M5_3:
@@ -2640,12 +2910,42 @@ def log_recent_closed_deals(cfg, lookback_hours=24, started_ts=None):
             else:
                 strat_label = str(sid or "Mode1")
             reason_txt = _deal_reason_text(getattr(d, "reason", -1))
+            # v25 diagnostics: realized R, hold time, MFE/MAE and entry context
+            # so every close is a self-contained post-mortem in the log.
+            init_risk = float(journal.get("init_risk", 0.0) or 0.0)
+            if init_risk <= 0 and isinstance(entry_price, (int, float)):
+                sl0 = float(journal.get("sl0", 0.0) or 0.0)
+                if sl0 > 0:
+                    init_risk = abs(float(entry_price) - sl0)
+            r_txt = "-"
+            if init_risk > 0 and isinstance(entry_price, (int, float)) and side in ("BUY", "SELL"):
+                move_val = (exit_price - float(entry_price)) if side == "BUY" else (float(entry_price) - exit_price)
+                r_txt = f"{move_val / init_risk:+.2f}R"
+            in_ts = int(in_leg.get("time", 0) or 0)
+            if in_ts > 0 and d_ts > 0 and d_ts >= in_ts:
+                hold_min = (d_ts - in_ts) / 60.0
+                hold_txt = f"{hold_min:.0f}m" if hold_min < 180 else f"{hold_min/60.0:.1f}h"
+            else:
+                hold_txt = "-"
+            mfe = journal.get("mfe_r")
+            mae = journal.get("mae_r")
+            excursion_txt = (
+                f"mfe={float(mfe):+.2f}R mae={float(mae):+.2f}R"
+                if isinstance(mfe, (int, float)) and isinstance(mae, (int, float))
+                else "mfe/mae=-"
+            )
+            is_partial = pos_id in open_pos_ids
+            close_tag = "PARTIAL" if is_partial else "FINAL"
+            ctx_txt = str(journal.get("ctx", "") or "-")
             log(
-                f"[CLOSE][{MODE_LABELS.get(mode_id, mode_id)}/{strat_label}] {outcome} {side} "
-                f"entry={entry_txt} exit={exit_price:.2f} move={move_txt} pnl={pnl:+.2f} "
-                f"close_reason={reason_txt} comment={comment or '-'}",
+                f"[CLOSE][{MODE_LABELS.get(mode_id, mode_id)}/{strat_label}] {outcome} {side} {close_tag} "
+                f"entry={entry_txt} exit={exit_price:.2f} move={move_txt} ({r_txt}) pnl={pnl:+.2f} "
+                f"hold={hold_txt} close_reason={reason_txt} comment={comment or '-'} "
+                f"| {excursion_txt} | entry_ctx: {ctx_txt}",
                 "info",
             )
+            if not is_partial:
+                _trade_journal.pop(pos_id, None)
             _closed_deal_log_cache[ticket] = now
         # prune old cache entries
         if len(_closed_deal_log_cache) > 3000:
@@ -2822,13 +3122,9 @@ def open_trade(cfg, side, signal):
         "comment": trade_comment,
         "type_time": mt5.ORDER_TIME_GTC,
     }
-    preferred_fill = int(getattr(info, "filling_mode", -1))
-    fill_modes = [preferred_fill, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
-    # Keep order but avoid duplicates/invalid entries.
-    uniq_fill_modes = []
-    for fm in fill_modes:
-        if isinstance(fm, int) and fm >= 0 and fm not in uniq_fill_modes:
-            uniq_fill_modes.append(fm)
+    # v25 fix: translate the broker's filling_mode bitmask into real
+    # ORDER_FILLING_* constants (old code caused 10030 storms/late fills).
+    uniq_fill_modes = allowed_filling_modes(info)
 
     res = None
     attempts = []
@@ -2863,18 +3159,69 @@ def open_trade(cfg, side, signal):
     if res is None or getattr(res, "retcode", None) != mt5.TRADE_RETCODE_DONE:
         return False, "order_send failed | " + " | ".join(attempts[-3:])
 
+    pos_ticket = int(getattr(res, "order", 0) or 0)
+
     # Cache TP1/initial risk for Mode 2 post-entry management (TP1 partial + BE/LOCK).
     try:
-        if mode_id == MODE_SCALP_M1_2:
-            pos_ticket = int(getattr(res, "order", 0) or 0)
+        if mode_id == MODE_SCALP_M1_2 and pos_ticket > 0:
             s_tp1 = signal.get("tp1")
-            if pos_ticket > 0 and isinstance(s_tp1, (int, float)):
-                _mode2_be_cache[pos_ticket] = {
-                    "init_risk": float(stop_dist),
-                    "stage": "init",
-                    "tp1": float(s_tp1),
-                    "tp1_done": False,
-                }
+            if isinstance(s_tp1, (int, float)) and float(s_tp1) > 0:
+                tp1_cache = float(s_tp1)
+            else:
+                tp1_cache = price + stop_dist if side == "BUY" else price - stop_dist
+            # Enforce TP1 >= MODE2_TP1_MIN_R so the partial cannot cap winners early.
+            tp1_min = price + MODE2_TP1_MIN_R * stop_dist if side == "BUY" else price - MODE2_TP1_MIN_R * stop_dist
+            tp1_cache = max(tp1_cache, tp1_min) if side == "BUY" else min(tp1_cache, tp1_min)
+            _mode2_be_cache[pos_ticket] = {
+                "init_risk": float(stop_dist),
+                "stage": "init",
+                "tp1": float(tp1_cache),
+                "tp1_done": False,
+            }
+    except Exception:
+        pass
+
+    # v25 diagnostics: remember strategy + full entry context per ticket so
+    # the CLOSE log can explain the trade even after broker rewrites comments.
+    entry_ctx_txt = "-"
+    try:
+        ctx = signal.get("market_ctx", {}) if isinstance(signal.get("market_ctx"), dict) else {}
+        if ctx:
+            entry_ctx_txt = (
+                f"trend M5={'BUY' if ctx.get('trend_buy') else ('SELL' if ctx.get('trend_sell') else 'FLAT')}"
+                f"/M15={ctx.get('trend_m15', '-')}/H1={ctx.get('trend_h1', '-')}"
+                f" | session={'London/NY' if ctx.get('in_london_ny') else 'Off'}"
+                f" | box12={float(ctx.get('box12_pos', 0.5))*100:.0f}%"
+                f"{' (range-bound)' if ctx.get('range_bound') else ''}"
+                f" | dSup={float(ctx.get('dist_sup_atr', 0.0)):.1f}ATR dRes={float(ctx.get('dist_res_atr', 0.0)):.1f}ATR"
+                f" | vol={float(ctx.get('vol_ratio', 1.0)):.2f}x rsi={float(ctx.get('rsi', 50.0)):.0f}"
+                f" | atrRank={float(signal.get('atr_rank', 0.5))*100:.0f}%"
+            )
+        else:
+            entry_ctx_txt = (
+                f"atrRank={float(signal.get('atr_rank', 0.5))*100:.0f}% "
+                f"trend_strength={float(signal.get('trend_strength', 0.0)):.2f}"
+            )
+        if pos_ticket > 0:
+            if strategy_id:
+                _ticket_strategy_cache[pos_ticket] = strategy_id
+            _trade_journal[pos_ticket] = {
+                "mode": mode_id,
+                "sid": strategy_id or None,
+                "side": side,
+                "entry": float(price),
+                "sl0": float(sl),
+                "tp": float(tp),
+                "init_risk": float(stop_dist),
+                "lot": float(lot),
+                "open_ts": time.time(),
+                "mfe_r": 0.0,
+                "mae_r": 0.0,
+                "ctx": entry_ctx_txt,
+            }
+            if len(_ticket_strategy_cache) > 3000:
+                for tk in list(_ticket_strategy_cache.keys())[:1000]:
+                    _ticket_strategy_cache.pop(tk, None)
     except Exception:
         pass
 
@@ -2895,9 +3242,24 @@ def open_trade(cfg, side, signal):
             "ts": datetime.now().strftime("%H:%M:%S"),
         }
     )
+    if mode_id == MODE_SCALP_M1_2:
+        strat_label = MODE2_STRATEGY_LABELS.get(strategy_id, strategy_id or "-")
+    elif mode_id == MODE_DCA_M5_3:
+        strat_label = "DCA M5"
+    else:
+        strat_label = strategy_id or "Mode1"
+    s_tp1_log = signal.get("tp1")
+    tp1_txt = f"{float(s_tp1_log):.2f}" if isinstance(s_tp1_log, (int, float)) and float(s_tp1_log) > 0 else "-"
+    spread_now = abs(float(getattr(tick, "ask", 0.0)) - float(getattr(tick, "bid", 0.0)))
+    sig_entry_px = float(signal.get("entry", 0.0) or 0.0)
+    slip_txt = f"{price - sig_entry_px:+.2f}" if sig_entry_px > 0 else "-"
+    bar_lag_s = int(time.time()) % 300
     log(
-        f"OPEN {side} lot={lot:.2f} @ {price:.2f} SL={sl:.2f} TP={tp:.2f} | "
-        f"autoSL={sl_atr:.2f}ATR autoRR={rr:.2f} ({profile['regime']})"
+        f"[ENTRY][{MODE_LABELS.get(mode_id, mode_id)}/{strat_label}] {side} ticket={pos_ticket} lot={lot:.2f} "
+        f"@{price:.2f} SL={sl:.2f} ({stop_dist:.2f}={stop_dist/max(1e-9, atr_now):.2f}ATR) "
+        f"TP1={tp1_txt} TP2={tp:.2f} RR={rr:.2f} ({profile['regime']}) "
+        f"| slippage_vs_signal={slip_txt} spread={spread_now:.2f} bar_lag={bar_lag_s}s "
+        f"| ctx: {entry_ctx_txt}"
     )
     return True, "ok"
 
@@ -3105,8 +3467,27 @@ def run_worker(cfg):
                     else:
                         ttxt = "warming"
                     mode_bar_state.append(f"{MODE_LABELS.get(m, m)}@{ttxt}")
+                # v25: include open exposure so heartbeats also narrate account state.
+                hb_pos_txt = "open=0 floating=+0.00"
+                try:
+                    hb_pos = account_positions_all_modes(cfg)
+                    hb_float = float(sum(float(p.profit) for p in hb_pos)) if hb_pos else 0.0
+                    hb_detail = []
+                    for p in hb_pos[:4]:
+                        p_side = "BUY" if int(getattr(p, "type", -1)) == int(mt5.POSITION_TYPE_BUY) else "SELL"
+                        pj = _trade_journal.get(int(getattr(p, "ticket", 0) or 0), {})
+                        p_r = ""
+                        if float(pj.get("init_risk", 0.0) or 0.0) > 0:
+                            p_move = (float(p.price_current) - float(p.price_open)) if p_side == "BUY" else (float(p.price_open) - float(p.price_current))
+                            p_r = f"({p_move / float(pj['init_risk']):+.2f}R)"
+                        hb_detail.append(f"#{int(p.ticket)}{p_side[0]}{p_r}")
+                    hb_pos_txt = f"open={len(hb_pos)} floating={hb_float:+.2f}"
+                    if hb_detail:
+                        hb_pos_txt += " [" + " ".join(hb_detail) + "]"
+                except Exception:
+                    pass
                 log(
-                    f"[HEARTBEAT] worker alive | next M5 close in {sec_to_m5_close}s | "
+                    f"[HEARTBEAT] worker alive | next M5 close in {sec_to_m5_close}s | {hb_pos_txt} | "
                     f"modes={' ; '.join(mode_bar_state) if mode_bar_state else '-'}",
                     "info",
                 )
@@ -3116,6 +3497,7 @@ def run_worker(cfg):
                 last_deal_diag_t = now
             if now - last_be_manage_t >= 1.0:
                 try:
+                    update_trade_journal(cfg)
                     manage_mode2_break_even(cfg)
                 except Exception as be_exc:
                     log(f"[Mode 2 - BE] manager error: {be_exc}", "warn")
@@ -3233,11 +3615,20 @@ def run_worker(cfg):
                             trend_txt = "SELL"
                         session_txt = "London/NY" if bool(ctx.get("in_london_ny", False)) else "Off-session"
                         impulse_txt = "UP" if bool(ctx.get("up_impulse", False)) else ("DOWN" if bool(ctx.get("down_impulse", False)) else "-")
+                        # v25: richer per-bar market line — trend split by TF,
+                        # price position in the local box, distance to S/R and
+                        # signal lag vs the 5-minute grid.
+                        box_txt = f"{float(ctx.get('box12_pos', 0.5))*100:.0f}%"
+                        if bool(ctx.get("range_bound", False)):
+                            box_txt += "(range-bound)"
+                        bar_lag_s = int(now) % 300
                         log(
                             f"[{mode_label}/Market] close={_fmt_px(sig.get('close'))} | trend={trend_txt} "
+                            f"(M15={ctx.get('trend_m15', '-')},H1={ctx.get('trend_h1', '-')}) "
                             f"| session={session_txt} | impulse={impulse_txt} | atrRank={float(sig.get('atr_rank', 0.5))*100:.0f}% "
-                            f"| range12={float(ctx.get('range12_atr', 0.0)):.2f}ATR | range40={float(ctx.get('range40_atr', 0.0)):.2f}ATR "
-                            f"| vol={float(ctx.get('vol_ratio', 1.0)):.2f}x | rsi={float(ctx.get('rsi', 50.0)):.1f}",
+                            f"| box12={box_txt} w={float(ctx.get('range12_atr', 0.0)):.2f}ATR | range40={float(ctx.get('range40_atr', 0.0)):.2f}ATR "
+                            f"| dSup={float(ctx.get('dist_sup_atr', 0.0)):.1f}ATR dRes={float(ctx.get('dist_res_atr', 0.0)):.1f}ATR "
+                            f"| vol={float(ctx.get('vol_ratio', 1.0)):.2f}x | rsi={float(ctx.get('rsi', 50.0)):.1f} | bar_lag={bar_lag_s}s",
                             "info",
                         )
                         diag = update_mode2_market_diag(sig)
@@ -3347,6 +3738,24 @@ def run_worker(cfg):
                                         srt["last_signal"] = "WAIT"
                                         srt["signal_reason"] = f"NO TRADE | ưu tiên {MODE_LABELS.get(preferred_mode, preferred_mode)} cùng thanh M5"
                                         continue
+                                    # v25: circuit breaker across all mode2 strategies —
+                                    # the per-setup lock never fired when losses alternated
+                                    # between strategies.
+                                    g_locked, g_losses, g_rem = is_mode2_globally_locked(cfg)
+                                    if g_locked:
+                                        g_rem_min = max(1, int(np.ceil(float(g_rem) / 60.0)))
+                                        srt["last_signal"] = "WAIT"
+                                        srt["signal_reason"] = (
+                                            f"NO TRADE | [VETO global-lock] Mode 2 nghỉ {MODE2_GLOBAL_LOCK_MINUTES}m "
+                                            f"sau {g_losses} lệnh thua liên tiếp (còn ~{g_rem_min}m)"
+                                        )
+                                        log(
+                                            f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] [VETO global-lock] "
+                                            f"bỏ tín hiệu {s_side}: {g_losses} lệnh thua liên tiếp toàn Mode 2, "
+                                            f"nghỉ còn ~{g_rem_min}m",
+                                            "warn",
+                                        )
+                                        continue
                                     lock_minutes = MODE2_MEAN_REV_LOCK_MINUTES if sid == "mean_reversion" else MODE2_SETUP_LOCK_MINUTES
                                     min_losses = 1 if sid == "mean_reversion" else 2
                                     locked, loss_streak, remaining_sec = is_setup_temporarily_locked(
@@ -3361,6 +3770,12 @@ def run_worker(cfg):
                                         srt["last_signal"] = "WAIT"
                                         srt["signal_reason"] = (
                                             f"NO TRADE | setup lock {lock_minutes}m sau {loss_streak} lệnh thua liên tiếp (còn ~{rem_min}m)"
+                                        )
+                                        log(
+                                            f"[{mode_label}/{MODE2_STRATEGY_LABELS.get(sid, sid)}] [VETO setup-lock] "
+                                            f"bỏ tín hiệu {s_side}: {loss_streak} lệnh thua liên tiếp của setup này, "
+                                            f"nghỉ còn ~{rem_min}m",
+                                            "warn",
                                         )
                                         continue
                                     s_sig = dict(sig)
