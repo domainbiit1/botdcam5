@@ -36,6 +36,7 @@ BASE_URL = "https://api.legitsms.com/api/handler/"
 POLL_INTERVAL_MS = 10000
 REFUND_DELAY_SEC = 120
 API_MIN_INTERVAL_MS = 2100
+DEFAULT_COUNTRY_BY_SERVER = {"1": "187", "2": "1", "3": "usa"}
 
 
 class LegitSMSApi:
@@ -108,6 +109,7 @@ class MainWindow(QMainWindow):
 
         self.api = None
         self.selected_service_code = ""
+        self.selected_service_label = ""
         self.all_services = []
         self.filtered_services = []
         self.all_countries = []
@@ -410,8 +412,22 @@ class MainWindow(QMainWindow):
         value = self.country_combo.currentData()
         if value is None:
             txt = self.country_combo.currentText().strip()
-            return txt
-        return str(value).strip()
+            if txt:
+                return txt
+            server = self.server_combo.currentText().strip()
+            fallback = DEFAULT_COUNTRY_BY_SERVER.get(server, "")
+            if fallback:
+                self.country_combo.setEditText(fallback)
+                return fallback
+            return ""
+        out = str(value).strip()
+        if out:
+            return out
+        server = self.server_combo.currentText().strip()
+        fallback = DEFAULT_COUNTRY_BY_SERVER.get(server, "")
+        if fallback:
+            self.country_combo.setEditText(fallback)
+        return fallback
 
     def _set_countries(self, items, default_value=""):
         self.all_countries = list(items)
@@ -546,6 +562,7 @@ class MainWindow(QMainWindow):
             return
         row = self.filtered_services[row_idx]
         self.selected_service_code = row["code"]
+        self.selected_service_label = row.get("label", row["code"])
 
     def _load_order_cost(self, order_id: str, service: str, server: str, country: str):
         if not self._ensure_api(warn=False):
@@ -677,9 +694,13 @@ class MainWindow(QMainWindow):
             return
         server = self.server_combo.currentText().strip()
         country = self._current_country_value()
+        if not country:
+            QMessageBox.warning(self, "Country", "Please select a country before renting.")
+            return
         max_price = self.max_price_input.text().strip()
         operator = self.operator_input.text().strip()
-        self.log(f"Buying number: server={server} country={country} service={service}")
+        show_service = self.selected_service_label or service
+        self.log(f"Buying number: server={server} country={country} service={show_service} [{service}]")
 
         def task():
             return self.api.get_number(server=server, service=service, country=country, max_price=max_price, operator=operator)
