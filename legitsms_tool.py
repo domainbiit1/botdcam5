@@ -4,6 +4,7 @@
 import json
 import sys
 import threading
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -32,7 +33,8 @@ from PyQt6.QtWidgets import (
 )
 
 BASE_URL = "https://api.legitsms.com/api/handler/"
-POLL_INTERVAL_MS = 3000
+POLL_INTERVAL_MS = 10000
+REFUND_DELAY_SEC = 120
 
 
 class LegitSMSApi:
@@ -110,15 +112,18 @@ class MainWindow(QMainWindow):
         self.country_refresh_timer = QTimer(self)
         self.country_refresh_timer.setSingleShot(True)
         self.country_refresh_timer.timeout.connect(self.refresh_services)
-        self.status_in_flight = False
+        self.inflight_orders = set()
 
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_tick)
         self.poll_timer.start(POLL_INTERVAL_MS)
+        self.ui_timer = QTimer(self)
+        self.ui_timer.timeout.connect(self._tick_order_countdowns)
+        self.ui_timer.start(1000)
 
         self._build_ui()
         self._apply_hacker_theme()
-        self.log("Ready. Enter API key and press Connect.")
+        self.log("Ready. Enter API key and press Connect. Auto refresh every 10s.")
 
     def _build_ui(self):
         root = QWidget()
@@ -205,6 +210,14 @@ class MainWindow(QMainWindow):
         refresh_btn = QPushButton("REFRESH NOW")
         refresh_btn.clicked.connect(self.check_all_statuses)
         controls.addWidget(refresh_btn)
+        self.refund_btn = QPushButton("CANCEL / REFUND SELECTED")
+        self.refund_btn.clicked.connect(self.refund_selected_order)
+        self.refund_btn.setEnabled(False)
+        controls.addWidget(self.refund_btn)
+        self.complete_btn = QPushButton("COMPLETE SELECTED")
+        self.complete_btn.clicked.connect(self.complete_selected_order)
+        self.complete_btn.setEnabled(False)
+        controls.addWidget(self.complete_btn)
         controls.addStretch(1)
         self.advanced_chk = QCheckBox("ADVANCED")
         self.advanced_chk.stateChanged.connect(self._toggle_advanced)
@@ -233,6 +246,7 @@ class MainWindow(QMainWindow):
         self.orders_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.orders_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.orders_table.cellClicked.connect(self._handle_order_click_copy)
+        self.orders_table.itemSelectionChanged.connect(self._update_action_buttons)
         self.orders_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.orders_table.customContextMenuRequested.connect(self._show_order_context_menu)
         right_layout.addWidget(self.orders_table, 2)
@@ -442,6 +456,57 @@ class MainWindow(QMainWindow):
         item = self.orders_table.item(row, 0)
         return item.text().strip() if item else ""
 
+    @staticmethod
+    def _is_final_status(status_text: str) -> bool:
+        s = str(status_text or "").strip().upper()
+        if s.startswith("STATUS_OK:"):
+            return True
+        return s in {"STATUS_CANCEL", "ACCESS_CANCEL", "ACCESS_ACTIVATION", "STATUS_FINISH"}
+
+    def _refund_remaining_sec(self, order: dict) -> int:
+        created_ts = float(order.get("created_ts", 0.0) or 0.0)
+        if created_ts <= 0:
+            return REFUND_DELAY_SEC
+        return max(0, int(created_ts + REFUND_DELAY_SEC - time.time()))
+
+    def _can_refund(self, order: dict) -> bool:
+        if not isinstance(order, dict):
+            return False
+        if bool(order.get("stop_refresh")):
+            return False
+        status_text = str(order.get("status", ""))
+        if self._is_final_status(status_text):
+            return False
+        if str(order.get("code", "-")).strip() not in {"", "-"}:
+            return False
+        return self._refund_remaining_sec(order) <= 0
+
+    def _status_display(self, order: dict) -> str:
+        status_text = str(order.get("status", "-"))
+        if bool(order.get("stop_refresh")):
+            return status_text
+        if str(order.get("code", "-")).strip() not in {"", "-"}:
+            return status_text
+        if self._can_refund(order):
+            return f"{status_text} | REFUND READY"
+        remain = self._refund_remaining_sec(order)
+        mm = remain // 60
+        ss = remain % 60
+        return f"{status_text} | refund in {mm:02d}:{ss:02d}"
+
+    def _tick_order_countdowns(self):
+        if not self.orders:
+            return
+        for order in self.orders.values():
+            self._upsert_order_row(order)
+        self._update_action_buttons()
+
+    def _update_action_buttons(self):
+        oid = self._selected_order_id()
+        order = self.orders.get(oid) if oid else None
+        self.complete_btn.setEnabled(bool(order))
+        self.refund_btn.setEnabled(self._can_refund(order) if order else False)
+
     def _paint_order_row(self, row_index: int, status_text: str):
         if status_text.startswith("STATUS_OK:"):
             color = QColor("#12331e")
@@ -456,13 +521,14 @@ class MainWindow(QMainWindow):
 
     def _upsert_order_row(self, order):
         oid = str(order["id"])
+        status_ui = self._status_display(order)
         values = [
             oid,
             str(order.get("service", "-")),
             str(order.get("phone", "-")),
             str(order.get("code", "-")),
             str(order.get("cost", "-")),
-            str(order.get("status", "-")),
+            status_ui,
         ]
         if oid in self.order_row_map:
             row = self.order_row_map[oid]
@@ -513,6 +579,7 @@ class MainWindow(QMainWindow):
                         "cost": "-",
                         "status": "STATUS_WAIT_CODE",
                         "stop_refresh": False,
+                        "created_ts": time.time(),
                     }
                     self._upsert_order_row(self.orders[oid])
             elif resp.startswith("HTTP_ERROR:429"):
@@ -538,6 +605,20 @@ class MainWindow(QMainWindow):
 
         self._run_bg(task, done)
 
+    def refund_selected_order(self):
+        oid = self._selected_order_id()
+        if not oid:
+            QMessageBox.warning(self, "Order", "Please select an order first.")
+            return
+        order = self.orders.get(oid)
+        if not self._can_refund(order):
+            remain = self._refund_remaining_sec(order or {})
+            mm = remain // 60
+            ss = remain % 60
+            self.log(f"Refund locked for {oid}: wait {mm:02d}:{ss:02d} (needs 2m without code).")
+            return
+        self._set_status(oid, "8")
+
     def cancel_selected_order(self):
         self._set_status(self._selected_order_id(), "8")
 
@@ -553,15 +634,15 @@ class MainWindow(QMainWindow):
             self._check_status_order(oid)
 
     def _check_status_order(self, order_id: str):
-        if self.status_in_flight:
+        if order_id in self.inflight_orders:
             return
-        self.status_in_flight = True
+        self.inflight_orders.add(order_id)
 
         def task():
             return self.api.get_status(order_id)
 
         def done(resp):
-            self.status_in_flight = False
+            self.inflight_orders.discard(order_id)
             if order_id in self.orders:
                 self.orders[order_id]["status"] = resp
                 code = self._extract_code(resp)
@@ -598,11 +679,15 @@ class MainWindow(QMainWindow):
         row = self.orders_table.rowAt(pos.y())
         if row >= 0:
             self.orders_table.selectRow(row)
+        oid = self._selected_order_id()
+        order = self.orders.get(oid) if oid else None
         menu = QMenu(self)
-        cancel_action = QAction("Cancel selected", self)
+        cancel_action = QAction("Cancel/Refund selected", self)
         done_action = QAction("Complete selected", self)
-        cancel_action.triggered.connect(self.cancel_selected_order)
+        cancel_action.setEnabled(self._can_refund(order) if order else False)
+        cancel_action.triggered.connect(self.refund_selected_order)
         done_action.triggered.connect(self.complete_selected_order)
+        done_action.setEnabled(bool(order))
         menu.addAction(cancel_action)
         menu.addAction(done_action)
         menu.exec(self.orders_table.viewport().mapToGlobal(pos))
