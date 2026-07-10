@@ -1,13 +1,35 @@
 #!/usr/bin/env python3
-"""LegitSMS Tool - professional two-panel UI."""
+"""LegitSMS Tool - PyQt6 hacker-style desktop UI."""
 
 import json
+import sys
 import threading
-import tkinter as tk
-from tkinter import ttk, messagebox
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QObject
+from PyQt6.QtGui import QAction, QColor
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFormLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 BASE_URL = "https://api.legitsms.com/api/handler/"
 POLL_INTERVAL_MS = 3000
@@ -67,240 +89,233 @@ class LegitSMSApi:
         return self._request(action="setStatus", id=order_id.strip(), status=status_code.strip())
 
 
-class App(tk.Tk):
+class AsyncBridge(QObject):
+    done = pyqtSignal(object)
+
+
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("LegitSMS Tool")
-        self.geometry("1180x760")
-        self.minsize(1080, 700)
+        self.setWindowTitle("LegitSMS // Hacker Console")
+        self.resize(1240, 800)
+        self.setMinimumSize(1080, 700)
 
         self.api = None
-        self.status_in_flight = False
         self.selected_service_code = ""
-        self.filtered_services = []
         self.all_services = []
-        self.orders = {}  # order_id -> dict
-        self.polling_enabled = True
-        self.country_refresh_after = None
-        self.connected_var = tk.StringVar(value="Disconnected")
+        self.filtered_services = []
+        self.orders = {}
+        self.order_row_map = {}
+        self._bridges = []
+        self.country_refresh_timer = QTimer(self)
+        self.country_refresh_timer.setSingleShot(True)
+        self.country_refresh_timer.timeout.connect(self.refresh_services)
+        self.status_in_flight = False
 
-        self._init_style()
+        self.poll_timer = QTimer(self)
+        self.poll_timer.timeout.connect(self._poll_tick)
+        self.poll_timer.start(POLL_INTERVAL_MS)
+
         self._build_ui()
-        self._poll_tick()
-
-    def _init_style(self):
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("App.TFrame", background="#f5f7fb")
-        style.configure("Card.TFrame", background="#ffffff", relief="flat")
-        style.configure("Header.TLabel", background="#ffffff", font=("Segoe UI", 18, "bold"), foreground="#0f172a")
-        style.configure("Sub.TLabel", background="#ffffff", font=("Segoe UI", 10), foreground="#475569")
-        style.configure("Small.TLabel", background="#ffffff", font=("Segoe UI", 9), foreground="#64748b")
-        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
-        style.configure("Muted.TButton", font=("Segoe UI", 9))
-        self.configure(bg="#f5f7fb")
+        self._apply_hacker_theme()
+        self.log("Ready. Enter API key and press Connect.")
 
     def _build_ui(self):
-        root = ttk.Frame(self, style="App.TFrame", padding=12)
-        root.pack(fill="both", expand=True)
+        root = QWidget()
+        self.setCentralWidget(root)
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setSpacing(10)
 
-        top = ttk.Frame(root, style="Card.TFrame", padding=(12, 10))
-        top.pack(fill="x", pady=(0, 10))
-        ttk.Label(top, text="API Key", style="Small.TLabel").pack(side="left", padx=(0, 8))
-        self.api_key_entry = ttk.Entry(top, width=70, show="*")
-        self.api_key_entry.pack(side="left", fill="x", expand=True)
-        self.api_key_entry.bind("<Return>", lambda _e: self.set_api_key())
-        ttk.Button(top, text="Connect", command=self.set_api_key, style="Accent.TButton").pack(side="left", padx=(8, 0))
-        ttk.Label(top, textvariable=self.connected_var, style="Sub.TLabel").pack(side="left", padx=(12, 0))
+        top_bar = QWidget()
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(10, 8, 10, 8)
+        top_layout.setSpacing(8)
+        top_layout.addWidget(QLabel("API KEY"))
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_input.returnPressed.connect(self.set_api_key)
+        top_layout.addWidget(self.api_key_input, 1)
+        connect_btn = QPushButton("CONNECT")
+        connect_btn.clicked.connect(self.set_api_key)
+        top_layout.addWidget(connect_btn)
+        self.connected_label = QLabel("DISCONNECTED")
+        top_layout.addWidget(self.connected_label)
+        root_layout.addWidget(top_bar)
 
-        body = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
-        body.pack(fill="both", expand=True)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root_layout.addWidget(splitter, 1)
 
-        left = ttk.Frame(body, style="Card.TFrame", padding=12)
-        right = ttk.Frame(body, style="Card.TFrame", padding=12)
-        body.add(left, weight=1)
-        body.add(right, weight=2)
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(10, 10, 10, 10)
+        left_layout.setSpacing(8)
+        left_layout.addWidget(QLabel("SERVICES // MARKET"))
 
-        self._build_left_panel(left)
-        self._build_right_panel(right)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Server"))
+        self.server_combo = QComboBox()
+        self.server_combo.addItems(["1", "2", "3"])
+        self.server_combo.currentTextChanged.connect(lambda _v: self.refresh_services())
+        row.addWidget(self.server_combo)
+        row.addWidget(QLabel("Country"))
+        self.country_input = QLineEdit("187")
+        self.country_input.returnPressed.connect(self.refresh_services)
+        self.country_input.textChanged.connect(lambda _t: self.country_refresh_timer.start(500))
+        row.addWidget(self.country_input)
+        left_layout.addLayout(row)
 
-    def _build_left_panel(self, parent):
-        ttk.Label(parent, text="Phone Verifications", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(parent, text="Rent a phone and auto-check incoming SMS code.", style="Sub.TLabel").pack(anchor="w", pady=(2, 12))
+        search_row = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("search service...")
+        self.search_input.textChanged.connect(self.apply_service_filter)
+        search_row.addWidget(self.search_input, 1)
+        reload_btn = QPushButton("RELOAD")
+        reload_btn.clicked.connect(self.refresh_services)
+        search_row.addWidget(reload_btn)
+        left_layout.addLayout(search_row)
 
-        row0 = ttk.Frame(parent, style="Card.TFrame")
-        row0.pack(fill="x", pady=(0, 8))
-        ttk.Label(row0, text="Server", style="Small.TLabel").pack(side="left")
-        self.server_combo = ttk.Combobox(row0, values=["1", "2", "3"], state="readonly", width=6)
-        self.server_combo.set("1")
-        self.server_combo.pack(side="left", padx=(8, 16))
-        self.server_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_services())
-        ttk.Label(row0, text="Country", style="Small.TLabel").pack(side="left")
-        self.country_entry = ttk.Entry(row0, width=12)
-        self.country_entry.insert(0, "187")
-        self.country_entry.pack(side="left", padx=(8, 0))
-        self.country_entry.bind("<Return>", lambda _e: self.refresh_services())
-        self.country_entry.bind("<KeyRelease>", self._debounced_country_refresh)
+        self.service_table = QTableWidget(0, 2)
+        self.service_table.setHorizontalHeaderLabels(["SERVICE", "PRICE"])
+        self.service_table.verticalHeader().setVisible(False)
+        self.service_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.service_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.service_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.service_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.service_table.itemSelectionChanged.connect(self.on_service_select)
+        self.service_table.cellDoubleClicked.connect(lambda _r, _c: self.rent_selected_service())
+        left_layout.addWidget(self.service_table, 1)
 
-        search_row = ttk.Frame(parent, style="Card.TFrame")
-        search_row.pack(fill="x", pady=(0, 10))
-        self.search_entry = ttk.Entry(search_row)
-        self.search_entry.insert(0, "Search service...")
-        self.search_entry.pack(side="left", fill="x", expand=True)
-        self.search_entry.bind("<FocusIn>", self._clear_search_placeholder)
-        self.search_entry.bind("<FocusOut>", self._restore_search_placeholder)
-        self.search_entry.bind("<KeyRelease>", lambda _e: self.apply_service_filter())
-        ttk.Button(search_row, text="Reload", command=self.refresh_services, style="Muted.TButton").pack(side="left", padx=(8, 0))
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(10, 10, 10, 10)
+        right_layout.setSpacing(8)
 
-        cols = ("service", "price")
-        self.service_tree = ttk.Treeview(parent, columns=cols, show="headings", height=20)
-        self.service_tree.heading("service", text="SERVICE")
-        self.service_tree.heading("price", text="PRICE")
-        self.service_tree.column("service", width=240, anchor="w")
-        self.service_tree.column("price", width=80, anchor="e")
-        self.service_tree.pack(fill="both", expand=True)
-        self.service_tree.bind("<<TreeviewSelect>>", self.on_service_select)
-        self.service_tree.bind("<Double-1>", lambda _e: self.rent_selected_service())
+        title_row = QHBoxLayout()
+        title_row.addWidget(QLabel("ORDERS // RUNTIME"))
+        self.counter_label = QLabel("0 / 5")
+        self.counter_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        title_row.addWidget(self.counter_label, 1)
+        right_layout.addLayout(title_row)
 
-    def _build_right_panel(self, parent):
-        top = ttk.Frame(parent, style="Card.TFrame")
-        top.pack(fill="x")
-        ttk.Label(top, text="Rented numbers", style="Header.TLabel").pack(side="left")
-        self.counter_var = tk.StringVar(value="0 / 5")
-        ttk.Label(top, textvariable=self.counter_var, style="Sub.TLabel").pack(side="right")
+        controls = QHBoxLayout()
+        rent_btn = QPushButton("RENT SELECTED SERVICE")
+        rent_btn.clicked.connect(self.rent_selected_service)
+        controls.addWidget(rent_btn)
+        refresh_btn = QPushButton("REFRESH NOW")
+        refresh_btn.clicked.connect(self.check_all_statuses)
+        controls.addWidget(refresh_btn)
+        controls.addStretch(1)
+        self.advanced_chk = QCheckBox("ADVANCED")
+        self.advanced_chk.stateChanged.connect(self._toggle_advanced)
+        controls.addWidget(self.advanced_chk)
+        right_layout.addLayout(controls)
 
-        controls = ttk.Frame(parent, style="Card.TFrame")
-        controls.pack(fill="x", pady=(10, 8))
-        ttk.Button(controls, text="Rent Selected Service", command=self.rent_selected_service, style="Accent.TButton").pack(side="left")
-        ttk.Button(controls, text="Refresh Now", command=self.check_all_statuses, style="Muted.TButton").pack(side="left", padx=(8, 0))
-        self.show_advanced_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            controls,
-            text="Advanced",
-            variable=self.show_advanced_var,
-            command=self._toggle_advanced_controls,
-        ).pack(side="right")
+        self.advanced_box = QWidget()
+        adv_form = QFormLayout(self.advanced_box)
+        adv_form.setContentsMargins(0, 0, 0, 0)
+        self.max_price_input = QLineEdit()
+        self.operator_input = QLineEdit()
+        adv_form.addRow("Max Price", self.max_price_input)
+        adv_form.addRow("Operator", self.operator_input)
+        self.advanced_box.setVisible(False)
+        right_layout.addWidget(self.advanced_box)
 
-        self.advanced_row = ttk.Frame(parent, style="Card.TFrame")
-        self.advanced_row.pack(fill="x", pady=(0, 8))
-        ttk.Label(self.advanced_row, text="Max Price", style="Small.TLabel").pack(side="left")
-        self.max_price_entry = ttk.Entry(self.advanced_row, width=10)
-        self.max_price_entry.pack(side="left", padx=(6, 12))
-        ttk.Label(self.advanced_row, text="Operator", style="Small.TLabel").pack(side="left")
-        self.operator_entry = ttk.Entry(self.advanced_row, width=14)
-        self.operator_entry.pack(side="left", padx=(6, 12))
-        self._toggle_advanced_controls()
+        self.orders_table = QTableWidget(0, 6)
+        self.orders_table.setHorizontalHeaderLabels(["ID", "SERVICE", "PHONE", "CODE", "COST", "STATUS"])
+        self.orders_table.verticalHeader().setVisible(False)
+        self.orders_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.orders_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.orders_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.orders_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.orders_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.orders_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.orders_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.orders_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.orders_table.cellClicked.connect(self._handle_order_click_copy)
+        self.orders_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.orders_table.customContextMenuRequested.connect(self._show_order_context_menu)
+        right_layout.addWidget(self.orders_table, 2)
 
-        cols = ("id", "service", "phone", "code", "cost", "status")
-        self.orders_tree = ttk.Treeview(parent, columns=cols, show="headings", height=16)
-        headings = {
-            "id": "ID",
-            "service": "SERVICE",
-            "phone": "PHONE",
-            "code": "CODE",
-            "cost": "COST",
-            "status": "STATUS",
-        }
-        widths = {"id": 90, "service": 190, "phone": 135, "code": 110, "cost": 90, "status": 240}
-        for c in cols:
-            self.orders_tree.heading(c, text=headings[c])
-            self.orders_tree.column(c, width=widths[c], anchor="w")
-        self.orders_tree.pack(fill="both", expand=True)
-        self.orders_tree.tag_configure("ok", background="#ecfdf3")
-        self.orders_tree.tag_configure("wait", background="#fffdf0")
-        self.orders_tree.tag_configure("error", background="#fef2f2")
-        self.orders_tree.bind("<Button-3>", self._show_order_context_menu)
-        self.orders_tree.bind("<ButtonRelease-1>", self._handle_order_left_click)
-        self._order_menu = tk.Menu(self, tearoff=0)
-        self._order_menu.add_command(label="Cancel selected", command=self.cancel_selected_order)
-        self._order_menu.add_command(label="Complete selected", command=self.complete_selected_order)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        right_layout.addWidget(self.log_text, 1)
 
-        log_box = ttk.LabelFrame(parent, text="Logs", padding=8)
-        log_box.pack(fill="both", expand=True, pady=(10, 0))
-        self.log_text = tk.Text(log_box, height=8, wrap="word")
-        self.log_text.pack(fill="both", expand=True)
-        self.log_text.configure(state="disabled")
-        self.log("Ready. Set API key to load services. SMS refresh is automatic every 3 seconds.")
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+
+    def _apply_hacker_theme(self):
+        self.setStyleSheet(
+            """
+            QWidget {
+                background: #060b08;
+                color: #86ff9d;
+                font-family: "Consolas", "Courier New", monospace;
+                font-size: 12px;
+            }
+            QMainWindow, QSplitter, QTextEdit, QTableWidget, QLineEdit, QComboBox {
+                background: #0a120d;
+                border: 1px solid #1e5b2f;
+            }
+            QPushButton {
+                background: #102718;
+                border: 1px solid #2f9a50;
+                color: #a6ffbc;
+                padding: 6px 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #15351f;
+            }
+            QHeaderView::section {
+                background: #102718;
+                color: #8dffab;
+                border: 1px solid #2f9a50;
+                padding: 4px;
+            }
+            QTableWidget::item:selected {
+                background: #1a3b25;
+                color: #d7ffe0;
+            }
+            QLineEdit, QComboBox, QTextEdit {
+                selection-background-color: #215a32;
+                selection-color: #e2ffea;
+            }
+            """
+        )
 
     def log(self, message: str):
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"{message}\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+        self.log_text.append(message)
+        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
 
-    def _debounced_country_refresh(self, _event=None):
-        if self.country_refresh_after is not None:
-            self.after_cancel(self.country_refresh_after)
-        self.country_refresh_after = self.after(500, self.refresh_services)
+    def _run_bg(self, fn, callback):
+        bridge = AsyncBridge()
+        self._bridges.append(bridge)
 
-    def _toggle_advanced_controls(self):
-        if bool(self.show_advanced_var.get()):
-            self.advanced_row.pack(fill="x", pady=(0, 8))
-        else:
-            self.advanced_row.pack_forget()
+        def finish(result):
+            try:
+                callback(result)
+            finally:
+                if bridge in self._bridges:
+                    self._bridges.remove(bridge)
 
-    def _clear_search_placeholder(self, _event=None):
-        if self.search_entry.get().strip().lower() == "search service...":
-            self.search_entry.delete(0, "end")
+        bridge.done.connect(finish)
 
-    def _restore_search_placeholder(self, _event=None):
-        if not self.search_entry.get().strip():
-            self.search_entry.insert(0, "Search service...")
-
-    def _show_order_context_menu(self, event):
-        row_id = self.orders_tree.identify_row(event.y)
-        if row_id:
-            self.orders_tree.selection_set(row_id)
-            self._order_menu.tk_popup(event.x_root, event.y_root)
-            self._order_menu.grab_release()
-
-    @staticmethod
-    def _normalize_phone_for_copy(phone: str) -> str:
-        raw = str(phone).strip()
-        digits = "".join(ch for ch in raw if ch.isdigit())
-        if len(digits) == 11 and digits.startswith("1"):
-            return digits[1:]
-        return raw
-
-    def _copy_to_clipboard(self, value: str):
-        text = str(value).strip()
-        if not text or text == "-":
-            return
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(text)
-        except Exception:
-            return
-
-    def _handle_order_left_click(self, event):
-        row_id = self.orders_tree.identify_row(event.y)
-        col_id = self.orders_tree.identify_column(event.x)
-        if not row_id or not col_id:
-            return
-        values = self.orders_tree.item(row_id, "values")
-        if not values:
-            return
-        # columns: ("id", "service", "phone", "code", "cost", "status")
-        if col_id == "#3":
-            phone = self._normalize_phone_for_copy(values[2] if len(values) > 2 else "")
-            self._copy_to_clipboard(phone)
-            self.log(f"Copied phone: {phone}")
-        elif col_id == "#4":
-            code = values[3] if len(values) > 3 else ""
-            self._copy_to_clipboard(code)
-            self.log(f"Copied code: {code}")
-
-    def _run_bg(self, fn, on_done):
         def worker():
-            result = fn()
-            self.after(0, lambda: on_done(result))
+            try:
+                result = fn()
+            except Exception as exc:
+                result = f"WORKER_ERROR:{exc}"
+            bridge.done.emit(result)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _ensure_api(self, warn=True):
         if self.api is None:
             if warn:
-                messagebox.showwarning("API key missing", "Please set API key first.")
+                QMessageBox.warning(self, "API key missing", "Please connect API key first.")
             return False
         return True
 
@@ -317,21 +332,38 @@ class App(tk.Tk):
             return status_text.split(":", 1)[1].strip()
         return "-"
 
+    @staticmethod
+    def _normalize_phone_for_copy(phone: str) -> str:
+        raw = str(phone).strip()
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if len(digits) == 11 and digits.startswith("1"):
+            return digits[1:]
+        return raw
+
+    def _copy(self, text: str):
+        value = str(text).strip()
+        if not value or value == "-":
+            return
+        QApplication.clipboard().setText(value)
+
+    def _toggle_advanced(self):
+        self.advanced_box.setVisible(bool(self.advanced_chk.isChecked()))
+
     def set_api_key(self):
-        key = self.api_key_entry.get().strip()
+        key = self.api_key_input.text().strip()
         if not key:
-            messagebox.showwarning("Missing API key", "Please enter API key.")
+            QMessageBox.warning(self, "Missing API key", "Please enter API key.")
             return
         self.api = LegitSMSApi(key)
-        self.connected_var.set("Connected")
+        self.connected_label.setText("CONNECTED")
         self.log("Connected. Loading services...")
         self.refresh_services()
 
     def refresh_services(self):
         if not self._ensure_api(warn=False):
             return
-        server = self.server_combo.get().strip()
-        country = self.country_entry.get().strip()
+        server = self.server_combo.currentText().strip()
+        country = self.country_input.text().strip()
         if server == "3" and not country:
             self.log("Server 3 requires country.")
             return
@@ -369,35 +401,27 @@ class App(tk.Tk):
         self._run_bg(task, done)
 
     def apply_service_filter(self):
-        q = self.search_entry.get().strip().lower()
-        if q == "search service...":
-            q = ""
+        q = self.search_input.text().strip().lower()
         items = [x for x in self.all_services if q in x["label"].lower()] if q else list(self.all_services)
         self.filtered_services = items
-        for it in self.service_tree.get_children():
-            self.service_tree.delete(it)
-        for row in items:
-            self.service_tree.insert("", "end", values=(row["label"], row["price"]))
+        self.service_table.setRowCount(len(items))
+        for i, row in enumerate(items):
+            self.service_table.setItem(i, 0, QTableWidgetItem(row["label"]))
+            self.service_table.setItem(i, 1, QTableWidgetItem(row["price"]))
 
-    def on_service_select(self, _event=None):
-        selected = self.service_tree.selection()
-        if not selected:
+    def on_service_select(self):
+        row_idx = self.service_table.currentRow()
+        if row_idx < 0 or row_idx >= len(self.filtered_services):
             return
-        vals = self.service_tree.item(selected[0], "values")
-        if not vals:
-            return
-        label = vals[0]
-        for row in self.filtered_services:
-            if row["label"] == label:
-                self.selected_service_code = row["code"]
-                self._update_selected_price(row)
-                return
+        row = self.filtered_services[row_idx]
+        self.selected_service_code = row["code"]
+        self._update_selected_price(row)
 
     def _update_selected_price(self, row):
         if not self._ensure_api(warn=False):
             return
-        server = self.server_combo.get().strip()
-        country = self.country_entry.get().strip()
+        server = self.server_combo.currentText().strip()
+        country = self.country_input.text().strip()
         service = row["code"]
 
         def task():
@@ -406,53 +430,69 @@ class App(tk.Tk):
         def done(resp):
             data = self._parse_json(resp)
             if isinstance(data, dict) and str(data.get("status", "")).upper() == "SUCCESS":
-                price = str(data.get("price", "-"))
-                row["price"] = f"${price}"
+                row["price"] = f"${str(data.get('price', '-'))}"
                 self.apply_service_filter()
 
         self._run_bg(task, done)
 
     def _selected_order_id(self):
-        selected = self.orders_tree.selection()
-        if not selected:
+        row = self.orders_table.currentRow()
+        if row < 0:
             return ""
-        vals = self.orders_tree.item(selected[0], "values")
-        return str(vals[0]) if vals else ""
+        item = self.orders_table.item(row, 0)
+        return item.text().strip() if item else ""
+
+    def _paint_order_row(self, row_index: int, status_text: str):
+        if status_text.startswith("STATUS_OK:"):
+            color = QColor("#12331e")
+        elif status_text.startswith("ERROR") or status_text.startswith("HTTP_ERROR") or status_text.startswith("NO_ACTIVATION"):
+            color = QColor("#3b1b1b")
+        else:
+            color = QColor("#2d290f")
+        for col in range(self.orders_table.columnCount()):
+            item = self.orders_table.item(row_index, col)
+            if item is not None:
+                item.setBackground(color)
 
     def _upsert_order_row(self, order):
         oid = str(order["id"])
-        values = (
+        values = [
             oid,
-            order.get("service", "-"),
-            order.get("phone", "-"),
-            order.get("code", "-"),
-            order.get("cost", "-"),
-            order.get("status", "-"),
-        )
-        status_text = str(order.get("status", ""))
-        tags = ("wait",)
-        if status_text.startswith("STATUS_OK:"):
-            tags = ("ok",)
-        elif status_text.startswith("ERROR") or status_text.startswith("HTTP_ERROR") or status_text.startswith("NO_ACTIVATION"):
-            tags = ("error",)
-
-        if self.orders_tree.exists(oid):
-            self.orders_tree.item(oid, values=values, tags=tags)
+            str(order.get("service", "-")),
+            str(order.get("phone", "-")),
+            str(order.get("code", "-")),
+            str(order.get("cost", "-")),
+            str(order.get("status", "-")),
+        ]
+        if oid in self.order_row_map:
+            row = self.order_row_map[oid]
         else:
-            self.orders_tree.insert("", "end", iid=oid, values=values, tags=tags)
-        self.counter_var.set(f"{len(self.orders)} / 5")
+            row = self.orders_table.rowCount()
+            self.orders_table.insertRow(row)
+            self.order_row_map[oid] = row
+
+        for col, value in enumerate(values):
+            item = self.orders_table.item(row, col)
+            if item is None:
+                item = QTableWidgetItem(value)
+                self.orders_table.setItem(row, col, item)
+            else:
+                item.setText(value)
+
+        self._paint_order_row(row, values[5])
+        self.counter_label.setText(f"{len(self.orders)} / 5")
 
     def rent_selected_service(self):
         if not self._ensure_api():
             return
         service = self.selected_service_code.strip()
         if not service:
-            messagebox.showwarning("Service", "Please select a service from the left list.")
+            QMessageBox.warning(self, "Service", "Please select a service from left table.")
             return
-        server = self.server_combo.get().strip()
-        country = self.country_entry.get().strip()
-        max_price = self.max_price_entry.get().strip()
-        operator = self.operator_entry.get().strip()
+        server = self.server_combo.currentText().strip()
+        country = self.country_input.text().strip()
+        max_price = self.max_price_input.text().strip()
+        operator = self.operator_input.text().strip()
         self.log(f"Buying number: server={server} country={country} service={service}")
 
         def task():
@@ -472,6 +512,7 @@ class App(tk.Tk):
                         "code": "-",
                         "cost": "-",
                         "status": "STATUS_WAIT_CODE",
+                        "stop_refresh": False,
                     }
                     self._upsert_order_row(self.orders[oid])
             elif resp.startswith("HTTP_ERROR:429"):
@@ -481,7 +522,7 @@ class App(tk.Tk):
 
     def _set_status(self, order_id: str, status_code: str):
         if not order_id:
-            messagebox.showwarning("Order", "Please select an order first.")
+            QMessageBox.warning(self, "Order", "Please select an order first.")
             return
 
         def task():
@@ -491,6 +532,8 @@ class App(tk.Tk):
             self.log(f"setStatus({status_code})[{order_id}] => {resp}")
             if order_id in self.orders:
                 self.orders[order_id]["status"] = resp
+                if status_code in {"6", "8"}:
+                    self.orders[order_id]["stop_refresh"] = True
                 self._upsert_order_row(self.orders[order_id])
 
         self._run_bg(task, done)
@@ -521,26 +564,57 @@ class App(tk.Tk):
             self.status_in_flight = False
             if order_id in self.orders:
                 self.orders[order_id]["status"] = resp
-                self.orders[order_id]["code"] = self._extract_code(resp)
-                self._upsert_order_row(self.orders[order_id])
+                code = self._extract_code(resp)
+                self.orders[order_id]["code"] = code
                 if resp.startswith("STATUS_OK:"):
                     self.orders[order_id]["stop_refresh"] = True
-                    try:
-                        self.clipboard_clear()
-                        self.clipboard_append(self.orders[order_id]["code"])
-                    except Exception:
-                        pass
+                    self._copy(code)
+                self._upsert_order_row(self.orders[order_id])
             self.log(f"getStatus({order_id}) => {resp}")
 
         self._run_bg(task, done)
 
     def _poll_tick(self):
-        if self.polling_enabled and self.orders:
+        if self.orders:
             self.check_all_statuses()
-        self.after(POLL_INTERVAL_MS, self._poll_tick)
+
+    def _handle_order_click_copy(self, row: int, column: int):
+        if row < 0:
+            return
+        if column == 2:
+            phone_item = self.orders_table.item(row, 2)
+            if phone_item:
+                phone = self._normalize_phone_for_copy(phone_item.text())
+                self._copy(phone)
+                self.log(f"Copied phone: {phone}")
+        elif column == 3:
+            code_item = self.orders_table.item(row, 3)
+            if code_item:
+                code = code_item.text().strip()
+                self._copy(code)
+                self.log(f"Copied code: {code}")
+
+    def _show_order_context_menu(self, pos):
+        row = self.orders_table.rowAt(pos.y())
+        if row >= 0:
+            self.orders_table.selectRow(row)
+        menu = QMenu(self)
+        cancel_action = QAction("Cancel selected", self)
+        done_action = QAction("Complete selected", self)
+        cancel_action.triggered.connect(self.cancel_selected_order)
+        done_action.triggered.connect(self.complete_selected_order)
+        menu.addAction(cancel_action)
+        menu.addAction(done_action)
+        menu.exec(self.orders_table.viewport().mapToGlobal(pos))
+
+
+def main():
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    main()
 
