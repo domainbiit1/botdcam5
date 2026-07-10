@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""LegitSMS desktop helper with auto refresh + dynamic service list."""
+"""LegitSMS Tool - professional two-panel UI."""
 
 import json
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 
 BASE_URL = "https://api.legitsms.com/api/handler/"
 POLL_INTERVAL_MS = 3000
@@ -18,18 +18,18 @@ class LegitSMSApi:
         self.api_key = api_key.strip()
 
     def _request(self, **params):
-        q = {"api_key": self.api_key, **params}
-        url = f"{BASE_URL}?{urlencode(q)}"
+        query = {"api_key": self.api_key, **params}
+        url = f"{BASE_URL}?{urlencode(query)}"
         req = Request(url, method="GET")
         try:
             with urlopen(req, timeout=25) as resp:
                 return resp.read().decode("utf-8", errors="replace").strip()
         except HTTPError as exc:
             try:
-                err_body = exc.read().decode("utf-8", errors="replace").strip()
+                body = exc.read().decode("utf-8", errors="replace").strip()
             except Exception:
-                err_body = str(exc)
-            return f"HTTP_ERROR:{exc.code}:{err_body}"
+                body = str(exc)
+            return f"HTTP_ERROR:{exc.code}:{body}"
         except URLError as exc:
             return f"NETWORK_ERROR:{exc}"
 
@@ -38,6 +38,14 @@ class LegitSMSApi:
         if server.strip() == "3":
             params["country"] = country.strip()
         return self._request(**params)
+
+    def get_price(self, server: str, service: str, country: str):
+        return self._request(
+            action="getPrices",
+            server=server.strip(),
+            service=service.strip(),
+            country=country.strip(),
+        )
 
     def get_number(self, server: str, service: str, country: str, max_price: str = "", operator: str = ""):
         params = {
@@ -63,89 +71,165 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("LegitSMS Tool")
-        self.geometry("980x700")
-        self.minsize(940, 640)
+        self.geometry("1180x760")
+        self.minsize(1080, 700)
 
         self.api = None
         self.status_in_flight = False
-        self.order_id_var = tk.StringVar()
-        self.phone_var = tk.StringVar(value="-")
-        self.last_status_var = tk.StringVar(value="-")
-        self.last_code_var = tk.StringVar(value="-")
-        self.service_map = {}
+        self.selected_service_code = ""
+        self.filtered_services = []
+        self.all_services = []
+        self.orders = {}  # order_id -> dict
         self.polling_enabled = True
 
+        self._init_style()
         self._build_ui()
         self._poll_tick()
 
+    def _init_style(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("App.TFrame", background="#f5f7fb")
+        style.configure("Card.TFrame", background="#ffffff", relief="flat")
+        style.configure("Header.TLabel", background="#ffffff", font=("Segoe UI", 18, "bold"), foreground="#0f172a")
+        style.configure("Sub.TLabel", background="#ffffff", font=("Segoe UI", 10), foreground="#475569")
+        style.configure("Small.TLabel", background="#ffffff", font=("Segoe UI", 9), foreground="#64748b")
+        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        self.configure(bg="#f5f7fb")
+
     def _build_ui(self):
-        top = ttk.Frame(self, padding=12)
-        top.pack(fill="x")
+        root = ttk.Frame(self, style="App.TFrame", padding=12)
+        root.pack(fill="both", expand=True)
 
-        ttk.Label(top, text="API Key").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.api_key_entry = ttk.Entry(top, width=62, show="*")
-        self.api_key_entry.grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Button(top, text="Set API Key", command=self.set_api_key).grid(row=0, column=2, padx=8, pady=4)
+        top = ttk.Frame(root, style="Card.TFrame", padding=(12, 10))
+        top.pack(fill="x", pady=(0, 10))
+        ttk.Label(top, text="API Key", style="Small.TLabel").pack(side="left", padx=(0, 8))
+        self.api_key_entry = ttk.Entry(top, width=70, show="*")
+        self.api_key_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(top, text="Set API Key", command=self.set_api_key, style="Accent.TButton").pack(side="left", padx=(8, 0))
 
-        ttk.Label(top, text="Server").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.server_combo = ttk.Combobox(top, values=["1", "2", "3"], state="readonly", width=8)
+        body = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
+        body.pack(fill="both", expand=True)
+
+        left = ttk.Frame(body, style="Card.TFrame", padding=12)
+        right = ttk.Frame(body, style="Card.TFrame", padding=12)
+        body.add(left, weight=1)
+        body.add(right, weight=2)
+
+        self._build_left_panel(left)
+        self._build_right_panel(right)
+
+    def _build_left_panel(self, parent):
+        ttk.Label(parent, text="Phone Verifications", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(parent, text="Rent a phone and auto-check incoming SMS code.", style="Sub.TLabel").pack(anchor="w", pady=(2, 12))
+
+        row0 = ttk.Frame(parent, style="Card.TFrame")
+        row0.pack(fill="x", pady=(0, 8))
+        ttk.Label(row0, text="Server", style="Small.TLabel").pack(side="left")
+        self.server_combo = ttk.Combobox(row0, values=["1", "2", "3"], state="readonly", width=6)
         self.server_combo.set("1")
-        self.server_combo.grid(row=1, column=1, sticky="w", pady=4)
+        self.server_combo.pack(side="left", padx=(8, 16))
         self.server_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_services())
-
-        ttk.Label(top, text="Service").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.service_combo = ttk.Combobox(top, width=46)
-        self.service_combo.grid(row=2, column=1, sticky="w", pady=4)
-        ttk.Button(top, text="Refresh Services", command=self.refresh_services).grid(row=2, column=2, padx=8, pady=4)
-
-        ttk.Label(top, text="Country").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.country_entry = ttk.Entry(top, width=25)
+        ttk.Label(row0, text="Country", style="Small.TLabel").pack(side="left")
+        self.country_entry = ttk.Entry(row0, width=12)
         self.country_entry.insert(0, "187")
-        self.country_entry.grid(row=3, column=1, sticky="w", pady=4)
+        self.country_entry.pack(side="left", padx=(8, 0))
         self.country_entry.bind("<Return>", lambda _e: self.refresh_services())
-        self.country_entry.bind("<FocusOut>", lambda _e: self.refresh_services(server3_only=True))
 
-        ttk.Label(top, text="Max Price (optional)").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.max_price_entry = ttk.Entry(top, width=25)
-        self.max_price_entry.grid(row=4, column=1, sticky="w", pady=4)
+        search_row = ttk.Frame(parent, style="Card.TFrame")
+        search_row.pack(fill="x", pady=(0, 10))
+        self.search_entry = ttk.Entry(search_row)
+        self.search_entry.insert(0, "Search service...")
+        self.search_entry.pack(side="left", fill="x", expand=True)
+        self.search_entry.bind("<KeyRelease>", lambda _e: self.apply_service_filter())
+        ttk.Button(search_row, text="Refresh", command=self.refresh_services).pack(side="left", padx=(8, 0))
 
-        ttk.Label(top, text="Operator (optional)").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.operator_entry = ttk.Entry(top, width=25)
-        self.operator_entry.grid(row=5, column=1, sticky="w", pady=4)
+        cols = ("service", "price")
+        self.service_tree = ttk.Treeview(parent, columns=cols, show="headings", height=20)
+        self.service_tree.heading("service", text="SERVICE")
+        self.service_tree.heading("price", text="PRICE")
+        self.service_tree.column("service", width=240, anchor="w")
+        self.service_tree.column("price", width=80, anchor="e")
+        self.service_tree.pack(fill="both", expand=True)
+        self.service_tree.bind("<<TreeviewSelect>>", self.on_service_select)
+        self.service_tree.bind("<Double-1>", lambda _e: self.rent_selected_service())
 
-        top.columnconfigure(1, weight=1)
+    def _build_right_panel(self, parent):
+        top = ttk.Frame(parent, style="Card.TFrame")
+        top.pack(fill="x")
+        ttk.Label(top, text="Rented numbers", style="Header.TLabel").pack(side="left")
+        self.counter_var = tk.StringVar(value="0 / 5")
+        ttk.Label(top, textvariable=self.counter_var, style="Sub.TLabel").pack(side="right")
 
-        actions = ttk.Frame(self, padding=(12, 0, 12, 8))
-        actions.pack(fill="x")
-        ttk.Button(actions, text="Get Number", command=self.get_number).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Check SMS Now", command=lambda: self.check_status_once(show_warnings=True)).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Cancel Order (status=8)", command=self.cancel_order).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Complete Order (status=6)", command=self.complete_order).pack(side="left", padx=(0, 8))
+        controls = ttk.Frame(parent, style="Card.TFrame")
+        controls.pack(fill="x", pady=(10, 8))
+        ttk.Label(controls, text="Max Price", style="Small.TLabel").pack(side="left")
+        self.max_price_entry = ttk.Entry(controls, width=10)
+        self.max_price_entry.pack(side="left", padx=(6, 12))
+        ttk.Label(controls, text="Operator", style="Small.TLabel").pack(side="left")
+        self.operator_entry = ttk.Entry(controls, width=14)
+        self.operator_entry.pack(side="left", padx=(6, 12))
+        ttk.Button(controls, text="Rent Selected Service", command=self.rent_selected_service, style="Accent.TButton").pack(side="left")
+        ttk.Button(controls, text="Cancel Selected", command=self.cancel_selected_order).pack(side="left", padx=(8, 0))
+        ttk.Button(controls, text="Complete Selected", command=self.complete_selected_order).pack(side="left", padx=(8, 0))
+        ttk.Button(controls, text="Check Now", command=self.check_all_statuses).pack(side="left", padx=(8, 0))
 
-        status_box = ttk.LabelFrame(self, text="Current Order", padding=12)
-        status_box.pack(fill="x", padx=12, pady=8)
-        ttk.Label(status_box, text="Order ID").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=2)
-        self.order_id_entry = ttk.Entry(status_box, textvariable=self.order_id_var, width=24)
-        self.order_id_entry.grid(row=0, column=1, sticky="w", pady=2)
-        ttk.Label(status_box, text="Phone").grid(row=0, column=2, sticky="w", padx=(20, 8), pady=2)
-        ttk.Label(status_box, textvariable=self.phone_var).grid(row=0, column=3, sticky="w", pady=2)
-        ttk.Label(status_box, text="Last Status").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=2)
-        ttk.Label(status_box, textvariable=self.last_status_var).grid(row=1, column=1, sticky="w", pady=2)
-        ttk.Label(status_box, text="Last SMS Code").grid(row=1, column=2, sticky="w", padx=(20, 8), pady=2)
-        ttk.Label(status_box, textvariable=self.last_code_var).grid(row=1, column=3, sticky="w", pady=2)
+        cols = ("id", "service", "phone", "code", "cost", "status", "actions")
+        self.orders_tree = ttk.Treeview(parent, columns=cols, show="headings", height=16)
+        headings = {
+            "id": "ID",
+            "service": "SERVICE",
+            "phone": "PHONE",
+            "code": "CODE",
+            "cost": "COST",
+            "status": "STATUS",
+            "actions": "ACTIONS",
+        }
+        widths = {"id": 90, "service": 180, "phone": 130, "code": 100, "cost": 90, "status": 200, "actions": 110}
+        for c in cols:
+            self.orders_tree.heading(c, text=headings[c])
+            self.orders_tree.column(c, width=widths[c], anchor="w")
+        self.orders_tree.pack(fill="both", expand=True)
 
-        log_box = ttk.LabelFrame(self, text="Logs", padding=8)
-        log_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self.log_text = tk.Text(log_box, height=22, wrap="word")
+        log_box = ttk.LabelFrame(parent, text="Logs", padding=8)
+        log_box.pack(fill="both", expand=True, pady=(10, 0))
+        self.log_text = tk.Text(log_box, height=8, wrap="word")
         self.log_text.pack(fill="both", expand=True)
         self.log_text.configure(state="disabled")
-        self.log("Ready. Set API key. SMS auto-refresh runs every 3 seconds.")
+        self.log("Ready. Set API key to load services. SMS refresh is automatic every 3 seconds.")
 
     def log(self, message: str):
         self.log_text.configure(state="normal")
         self.log_text.insert("end", f"{message}\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _run_bg(self, fn, on_done):
+        def worker():
+            result = fn()
+            self.after(0, lambda: on_done(result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ensure_api(self, warn=True):
+        if self.api is None:
+            if warn:
+                messagebox.showwarning("API key missing", "Please set API key first.")
+            return False
+        return True
+
+    @staticmethod
+    def _parse_json(text: str):
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_code(status_text: str):
+        if isinstance(status_text, str) and status_text.startswith("STATUS_OK:"):
+            return status_text.split(":", 1)[1].strip()
+        return "-"
 
     def set_api_key(self):
         key = self.api_key_entry.get().strip()
@@ -156,42 +240,14 @@ class App(tk.Tk):
         self.log("API key set.")
         self.refresh_services()
 
-    def _ensure_api(self, show_warning=True):
-        if self.api is None:
-            if show_warning:
-                messagebox.showwarning("API key missing", "Please set API key first.")
-            return False
-        return True
-
-    def _run_bg(self, fn, on_done):
-        def worker():
-            result = fn()
-            self.after(0, lambda: on_done(result))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @staticmethod
-    def _parse_code(status_text: str):
-        if status_text.startswith("STATUS_OK:"):
-            return status_text.split(":", 1)[1].strip()
-        return None
-
-    def _parse_json(self, text: str):
-        try:
-            return json.loads(text)
-        except Exception:
-            return None
-
-    def refresh_services(self, server3_only=False):
-        if not self._ensure_api(show_warning=False):
+    def refresh_services(self):
+        if not self._ensure_api(warn=False):
             return
         server = self.server_combo.get().strip()
-        if server3_only and server != "3":
-            return
         country = self.country_entry.get().strip()
         if server == "3" and not country:
+            self.log("Server 3 requires country.")
             return
-
         self.log(f"Loading services for server={server} ...")
 
         def task():
@@ -202,89 +258,161 @@ class App(tk.Tk):
             if data is None:
                 self.log(f"getServices raw: {resp}")
                 return
-            self.service_map = {}
-            values = []
+            items = []
             if server == "1":
-                services = data.get("services", []) if isinstance(data, dict) else []
-                for item in services:
-                    code = str(item.get("code", "")).strip()
-                    name = str(item.get("name", "")).strip()
+                for x in data.get("services", []) if isinstance(data, dict) else []:
+                    code = str(x.get("code", "")).strip()
+                    name = str(x.get("name", "")).strip()
                     if code:
-                        label = f"{code} | {name}" if name else code
-                        self.service_map[label] = code
-                        values.append(label)
+                        items.append({"label": f"{name} ({code})" if name else code, "code": code, "price": "-"})
             elif server == "2":
-                arr = data if isinstance(data, list) else []
-                for item in arr:
-                    sid = str(item.get("ID", "")).strip()
-                    name = str(item.get("name", "")).strip()
+                for x in data if isinstance(data, list) else []:
+                    sid = str(x.get("ID", "")).strip()
+                    name = str(x.get("name", "")).strip()
                     if sid:
-                        label = f"{sid} | {name}" if name else sid
-                        self.service_map[label] = sid
-                        values.append(label)
+                        items.append({"label": f"{name} ({sid})" if name else sid, "code": sid, "price": "-"})
             else:
-                if isinstance(data, dict):
-                    for key in data.keys():
-                        code = str(key).strip()
-                        if code:
-                            self.service_map[code] = code
-                            values.append(code)
-            values = sorted(values, key=lambda x: x.lower())
-            self.service_combo["values"] = values
-            if values:
-                self.service_combo.set(values[0])
-                self.log(f"Loaded {len(values)} services.")
-            else:
-                self.log("No services found for current server/country.")
+                for key in data.keys() if isinstance(data, dict) else []:
+                    items.append({"label": str(key), "code": str(key), "price": "-"})
+
+            self.all_services = sorted(items, key=lambda z: z["label"].lower())
+            self.apply_service_filter()
+            self.log(f"Loaded {len(self.all_services)} services.")
 
         self._run_bg(task, done)
 
-    def _selected_service_code(self):
-        raw = self.service_combo.get().strip()
-        if not raw:
-            return ""
-        if raw in self.service_map:
-            return self.service_map[raw]
-        return raw.split("|", 1)[0].strip()
+    def apply_service_filter(self):
+        q = self.search_entry.get().strip().lower()
+        items = [x for x in self.all_services if q in x["label"].lower()] if q else list(self.all_services)
+        self.filtered_services = items
+        for it in self.service_tree.get_children():
+            self.service_tree.delete(it)
+        for row in items:
+            self.service_tree.insert("", "end", values=(row["label"], row["price"]))
 
-    def get_number(self):
-        if not self._ensure_api():
+    def on_service_select(self, _event=None):
+        selected = self.service_tree.selection()
+        if not selected:
+            return
+        vals = self.service_tree.item(selected[0], "values")
+        if not vals:
+            return
+        label = vals[0]
+        for row in self.filtered_services:
+            if row["label"] == label:
+                self.selected_service_code = row["code"]
+                self._update_selected_price(row)
+                return
+
+    def _update_selected_price(self, row):
+        if not self._ensure_api(warn=False):
             return
         server = self.server_combo.get().strip()
-        service = self._selected_service_code()
+        country = self.country_entry.get().strip()
+        service = row["code"]
+
+        def task():
+            return self.api.get_price(server=server, service=service, country=country)
+
+        def done(resp):
+            data = self._parse_json(resp)
+            if isinstance(data, dict) and str(data.get("status", "")).upper() == "SUCCESS":
+                price = str(data.get("price", "-"))
+                row["price"] = f"${price}"
+                self.apply_service_filter()
+
+        self._run_bg(task, done)
+
+    def _selected_order_id(self):
+        selected = self.orders_tree.selection()
+        if not selected:
+            return ""
+        vals = self.orders_tree.item(selected[0], "values")
+        return str(vals[0]) if vals else ""
+
+    def _upsert_order_row(self, order):
+        oid = str(order["id"])
+        values = (
+            oid,
+            order.get("service", "-"),
+            order.get("phone", "-"),
+            order.get("code", "-"),
+            order.get("cost", "-"),
+            order.get("status", "-"),
+            "Cancel / Done",
+        )
+        if self.orders_tree.exists(oid):
+            self.orders_tree.item(oid, values=values)
+        else:
+            self.orders_tree.insert("", "end", iid=oid, values=values)
+        self.counter_var.set(f"{len(self.orders)} / 5")
+
+    def rent_selected_service(self):
+        if not self._ensure_api():
+            return
+        service = self.selected_service_code.strip()
+        if not service:
+            messagebox.showwarning("Service", "Please select a service from the left list.")
+            return
+        server = self.server_combo.get().strip()
         country = self.country_entry.get().strip()
         max_price = self.max_price_entry.get().strip()
         operator = self.operator_entry.get().strip()
-        if not service or not country:
-            messagebox.showwarning("Missing params", "Service and country are required.")
-            return
-        self.log(f"Requesting number: server={server} service={service} country={country}")
+        self.log(f"Buying number: server={server} country={country} service={service}")
 
         def task():
-            return self.api.get_number(server, service, country, max_price=max_price, operator=operator)
+            return self.api.get_number(server=server, service=service, country=country, max_price=max_price, operator=operator)
 
         def done(resp):
             self.log(f"getNumber response: {resp}")
             if resp.startswith("ACCESS_NUMBER:"):
                 parts = resp.split(":")
                 if len(parts) >= 3:
-                    self.order_id_var.set(parts[1].strip())
-                    self.phone_var.set(parts[2].strip())
-                    self.last_status_var.set("NEW_ORDER")
-                    self.last_code_var.set("-")
+                    oid = parts[1].strip()
+                    phone = parts[2].strip()
+                    self.orders[oid] = {
+                        "id": oid,
+                        "service": service,
+                        "phone": phone,
+                        "code": "-",
+                        "cost": "-",
+                        "status": "STATUS_WAIT_CODE",
+                    }
+                    self._upsert_order_row(self.orders[oid])
             elif resp.startswith("HTTP_ERROR:429"):
-                self.log("Rate limited (429). API limit is 1 request per 2 seconds.")
+                self.log("Rate limited (429). API limit is 1 request each 2 seconds.")
 
         self._run_bg(task, done)
 
-    def check_status_once(self, show_warnings=False):
-        if not self._ensure_api(show_warning=show_warnings):
-            return
-        order_id = self.order_id_var.get().strip()
+    def _set_status(self, order_id: str, status_code: str):
         if not order_id:
-            if show_warnings:
-                messagebox.showwarning("Order missing", "Please enter or buy an order first.")
+            messagebox.showwarning("Order", "Please select an order first.")
             return
+
+        def task():
+            return self.api.set_status(order_id, status_code)
+
+        def done(resp):
+            self.log(f"setStatus({status_code})[{order_id}] => {resp}")
+            if order_id in self.orders:
+                self.orders[order_id]["status"] = resp
+                self._upsert_order_row(self.orders[order_id])
+
+        self._run_bg(task, done)
+
+    def cancel_selected_order(self):
+        self._set_status(self._selected_order_id(), "8")
+
+    def complete_selected_order(self):
+        self._set_status(self._selected_order_id(), "6")
+
+    def check_all_statuses(self):
+        if not self._ensure_api(warn=False):
+            return
+        for oid in list(self.orders.keys()):
+            self._check_status_order(oid)
+
+    def _check_status_order(self, order_id: str):
         if self.status_in_flight:
             return
         self.status_in_flight = True
@@ -294,42 +422,18 @@ class App(tk.Tk):
 
         def done(resp):
             self.status_in_flight = False
-            self.last_status_var.set(resp)
-            code = self._parse_code(resp)
-            if code:
-                self.last_code_var.set(code)
+            if order_id in self.orders:
+                self.orders[order_id]["status"] = resp
+                self.orders[order_id]["code"] = self._extract_code(resp)
+                self._upsert_order_row(self.orders[order_id])
             self.log(f"getStatus({order_id}) => {resp}")
-            if resp.startswith("HTTP_ERROR:429"):
-                self.log("Rate limited (429). Keep polling interval >= 2 seconds.")
 
         self._run_bg(task, done)
 
     def _poll_tick(self):
-        if self.polling_enabled:
-            self.check_status_once(show_warnings=False)
+        if self.polling_enabled and self.orders:
+            self.check_all_statuses()
         self.after(POLL_INTERVAL_MS, self._poll_tick)
-
-    def _set_status(self, status_code: str):
-        if not self._ensure_api():
-            return
-        order_id = self.order_id_var.get().strip()
-        if not order_id:
-            messagebox.showwarning("Order missing", "Please enter order id.")
-            return
-
-        def task():
-            return self.api.set_status(order_id, status_code)
-
-        def done(resp):
-            self.log(f"setStatus({status_code}) => {resp}")
-
-        self._run_bg(task, done)
-
-    def cancel_order(self):
-        self._set_status("8")
-
-    def complete_order(self):
-        self._set_status("6")
 
 
 if __name__ == "__main__":
