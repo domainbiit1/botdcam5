@@ -63,6 +63,9 @@ class LegitSMSApi:
             params["country"] = country.strip()
         return self._request(**params)
 
+    def get_countries(self, server: str):
+        return self._request(action="getCountries", server=server.strip())
+
     def get_price(self, server: str, service: str, country: str):
         return self._request(
             action="getPrices",
@@ -106,6 +109,7 @@ class MainWindow(QMainWindow):
         self.selected_service_code = ""
         self.all_services = []
         self.filtered_services = []
+        self.all_countries = []
         self.orders = {}
         self.order_row_map = {}
         self._bridges = []
@@ -162,13 +166,14 @@ class MainWindow(QMainWindow):
         row.addWidget(QLabel("Server"))
         self.server_combo = QComboBox()
         self.server_combo.addItems(["1", "2", "3"])
-        self.server_combo.currentTextChanged.connect(lambda _v: self.refresh_services())
+        self.server_combo.currentTextChanged.connect(self.on_server_changed)
         row.addWidget(self.server_combo)
         row.addWidget(QLabel("Country"))
-        self.country_input = QLineEdit("187")
-        self.country_input.returnPressed.connect(self.refresh_services)
-        self.country_input.textChanged.connect(lambda _t: self.country_refresh_timer.start(500))
-        row.addWidget(self.country_input)
+        self.country_combo = QComboBox()
+        self.country_combo.setEditable(True)
+        self.country_combo.currentIndexChanged.connect(lambda _i: self.country_refresh_timer.start(250))
+        self.country_combo.lineEdit().returnPressed.connect(self.refresh_services)
+        row.addWidget(self.country_combo)
         left_layout.addLayout(row)
 
         search_row = QHBoxLayout()
@@ -372,13 +377,89 @@ class MainWindow(QMainWindow):
         self.api = LegitSMSApi(key)
         self.connected_label.setText("CONNECTED")
         self.log("Connected. Loading services...")
-        self.refresh_services()
+        self.on_server_changed()
+
+    def _current_country_value(self) -> str:
+        value = self.country_combo.currentData()
+        if value is None:
+            txt = self.country_combo.currentText().strip()
+            return txt
+        return str(value).strip()
+
+    def _set_countries(self, items, default_value=""):
+        self.all_countries = list(items)
+        self.country_combo.blockSignals(True)
+        self.country_combo.clear()
+        for x in self.all_countries:
+            self.country_combo.addItem(str(x["label"]), str(x["value"]))
+        if self.all_countries:
+            idx = 0
+            if default_value:
+                for i, x in enumerate(self.all_countries):
+                    if str(x["value"]) == str(default_value):
+                        idx = i
+                        break
+            self.country_combo.setCurrentIndex(idx)
+        self.country_combo.blockSignals(False)
+
+    def refresh_countries(self, then_refresh_services=True):
+        if not self._ensure_api(warn=False):
+            return
+        server = self.server_combo.currentText().strip()
+        self.log(f"Loading countries for server={server} ...")
+
+        def task():
+            return self.api.get_countries(server=server)
+
+        def done(resp):
+            data = self._parse_json(resp)
+            if data is None:
+                self.log(f"getCountries raw: {resp}")
+                return
+
+            items = []
+            default = ""
+            if server == "1":
+                for x in data if isinstance(data, list) else []:
+                    cid = str(x.get("id", "")).strip()
+                    eng = str(x.get("eng", "")).strip()
+                    if cid:
+                        label = f"{eng} ({cid})" if eng else cid
+                        items.append({"label": label, "value": cid})
+                        if cid == "187" or eng.lower() in {"usa", "united states", "united states of america"}:
+                            default = cid
+            elif server == "2":
+                for x in data if isinstance(data, list) else []:
+                    cid = str(x.get("ID", "")).strip()
+                    name = str(x.get("name", "")).strip()
+                    if cid:
+                        label = f"{name} ({cid})" if name else cid
+                        items.append({"label": label, "value": cid})
+                        if name.lower() in {"united states", "usa"}:
+                            default = cid
+            else:
+                for key, val in data.items() if isinstance(data, dict) else []:
+                    name = str(val.get("text_en", key)).strip() if isinstance(val, dict) else str(key)
+                    items.append({"label": f"{name} ({key})", "value": str(key)})
+                    if str(key).lower() in {"usa", "us", "united-states"} or name.lower() in {"usa", "united states"}:
+                        default = str(key)
+
+            items = sorted(items, key=lambda z: z["label"].lower())
+            self._set_countries(items, default_value=default)
+            self.log(f"Loaded {len(items)} countries.")
+            if then_refresh_services:
+                self.refresh_services()
+
+        self._run_bg(task, done)
+
+    def on_server_changed(self, *_args):
+        self.refresh_countries(then_refresh_services=True)
 
     def refresh_services(self):
         if not self._ensure_api(warn=False):
             return
         server = self.server_combo.currentText().strip()
-        country = self.country_input.text().strip()
+        country = self._current_country_value()
         if server == "3" and not country:
             self.log("Server 3 requires country.")
             return
@@ -431,11 +512,9 @@ class MainWindow(QMainWindow):
         row = self.filtered_services[row_idx]
         self.selected_service_code = row["code"]
 
-    def _load_order_cost(self, order_id: str, service: str):
+    def _load_order_cost(self, order_id: str, service: str, server: str, country: str):
         if not self._ensure_api(warn=False):
             return
-        server = self.server_combo.currentText().strip()
-        country = self.country_input.text().strip()
 
         def task():
             return self.api.get_price(server=server, service=service, country=country)
@@ -562,7 +641,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Service", "Please select a service from left table.")
             return
         server = self.server_combo.currentText().strip()
-        country = self.country_input.text().strip()
+        country = self._current_country_value()
         max_price = self.max_price_input.text().strip()
         operator = self.operator_input.text().strip()
         self.log(f"Buying number: server={server} country={country} service={service}")
@@ -586,9 +665,11 @@ class MainWindow(QMainWindow):
                         "status": "STATUS_WAIT_CODE",
                         "stop_refresh": False,
                         "created_ts": time.time(),
+                        "server": server,
+                        "country": country,
                     }
                     self._upsert_order_row(self.orders[oid])
-                    self._load_order_cost(oid, service)
+                    self._load_order_cost(oid, service, server, country)
             elif resp.startswith("HTTP_ERROR:429"):
                 self.log("Rate limited (429). API limit is 1 request each 2 seconds.")
 

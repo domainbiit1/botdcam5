@@ -3,7 +3,7 @@
 ## Overview
 Desktop tool for LegitSMS API with a hacker-style PyQt6 interface:
 - Connect API key
-- Auto-load services by server/country
+- Auto-load countries + services by server
 - Rent phone number
 - Auto-refresh SMS status every 10 seconds
 - Stop refresh for a phone automatically after code is received
@@ -13,6 +13,10 @@ Desktop tool for LegitSMS API with a hacker-style PyQt6 interface:
 - **Phone copy rule**: if phone format is `1xxxxxxxxxx` (11 digits, starts with `1`), copied value removes the first `1`.
 - **Code copy**: clicking CODE column copies code to clipboard.
 - **Auto-stop refresh**: when status is `STATUS_OK:<code>`, that order is excluded from future polling.
+- **Auto parameter mapping by server**:
+  - Server 1 uses country `id` + service `code`
+  - Server 2 uses country `ID` + service `ID`
+  - Server 3 uses country `key` + service `key`
 - **Request optimization**: tool does not prefetch all service prices. `cost` is loaded only for phones that were actually rented.
 - **Refund lock**: Cancel/Refund is locked for 2 minutes after rent. Countdown is shown in STATUS.
 - **Refund ready**: if code is still missing after 2 minutes, STATUS shows `REFUND READY` and Refund button/menu becomes clickable.
