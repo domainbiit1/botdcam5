@@ -210,6 +210,7 @@ class App(tk.Tk):
         self.orders_tree.tag_configure("wait", background="#fffdf0")
         self.orders_tree.tag_configure("error", background="#fef2f2")
         self.orders_tree.bind("<Button-3>", self._show_order_context_menu)
+        self.orders_tree.bind("<ButtonRelease-1>", self._handle_order_left_click)
         self._order_menu = tk.Menu(self, tearoff=0)
         self._order_menu.add_command(label="Cancel selected", command=self.cancel_selected_order)
         self._order_menu.add_command(label="Complete selected", command=self.complete_selected_order)
@@ -252,6 +253,42 @@ class App(tk.Tk):
             self.orders_tree.selection_set(row_id)
             self._order_menu.tk_popup(event.x_root, event.y_root)
             self._order_menu.grab_release()
+
+    @staticmethod
+    def _normalize_phone_for_copy(phone: str) -> str:
+        raw = str(phone).strip()
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if len(digits) == 11 and digits.startswith("1"):
+            return digits[1:]
+        return raw
+
+    def _copy_to_clipboard(self, value: str):
+        text = str(value).strip()
+        if not text or text == "-":
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except Exception:
+            return
+
+    def _handle_order_left_click(self, event):
+        row_id = self.orders_tree.identify_row(event.y)
+        col_id = self.orders_tree.identify_column(event.x)
+        if not row_id or not col_id:
+            return
+        values = self.orders_tree.item(row_id, "values")
+        if not values:
+            return
+        # columns: ("id", "service", "phone", "code", "cost", "status")
+        if col_id == "#3":
+            phone = self._normalize_phone_for_copy(values[2] if len(values) > 2 else "")
+            self._copy_to_clipboard(phone)
+            self.log(f"Copied phone: {phone}")
+        elif col_id == "#4":
+            code = values[3] if len(values) > 3 else ""
+            self._copy_to_clipboard(code)
+            self.log(f"Copied code: {code}")
 
     def _run_bg(self, fn, on_done):
         def worker():
@@ -467,7 +504,9 @@ class App(tk.Tk):
     def check_all_statuses(self):
         if not self._ensure_api(warn=False):
             return
-        for oid in list(self.orders.keys()):
+        for oid, order in list(self.orders.items()):
+            if bool(order.get("stop_refresh")):
+                continue
             self._check_status_order(oid)
 
     def _check_status_order(self, order_id: str):
@@ -485,6 +524,7 @@ class App(tk.Tk):
                 self.orders[order_id]["code"] = self._extract_code(resp)
                 self._upsert_order_row(self.orders[order_id])
                 if resp.startswith("STATUS_OK:"):
+                    self.orders[order_id]["stop_refresh"] = True
                     try:
                         self.clipboard_clear()
                         self.clipboard_append(self.orders[order_id]["code"])
