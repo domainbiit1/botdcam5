@@ -13,6 +13,7 @@ Desktop tool for LegitSMS API with a hacker-style PyQt6 interface:
 - **Phone copy rule**: if phone format is `1xxxxxxxxxx` (11 digits, starts with `1`), copied value removes the first `1`.
 - **Code copy**: clicking CODE column copies code to clipboard.
 - **Auto-stop refresh**: when status is `STATUS_OK:<code>`, that order is excluded from future polling.
+- **Request optimization**: tool does not prefetch all service prices. `cost` is loaded only for phones that were actually rented.
 - **Refund lock**: Cancel/Refund is locked for 2 minutes after rent. Countdown is shown in STATUS.
 - **Refund ready**: if code is still missing after 2 minutes, STATUS shows `REFUND READY` and Refund button/menu becomes clickable.
 - **Multi-phone independent timers**: each order has its own 2-minute countdown and refund state.

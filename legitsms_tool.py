@@ -35,8 +35,6 @@ from PyQt6.QtWidgets import (
 BASE_URL = "https://api.legitsms.com/api/handler/"
 POLL_INTERVAL_MS = 10000
 REFUND_DELAY_SEC = 120
-PRICE_PREFETCH_INTERVAL_MS = 2100
-PRICE_PREFETCH_LIMIT = 120
 
 
 class LegitSMSApi:
@@ -111,9 +109,6 @@ class MainWindow(QMainWindow):
         self.orders = {}
         self.order_row_map = {}
         self._bridges = []
-        self.price_prefetch_token = 0
-        self.price_prefetch_queue = []
-        self.price_prefetch_active = False
         self.country_refresh_timer = QTimer(self)
         self.country_refresh_timer.setSingleShot(True)
         self.country_refresh_timer.timeout.connect(self.refresh_services)
@@ -382,7 +377,6 @@ class MainWindow(QMainWindow):
     def refresh_services(self):
         if not self._ensure_api(warn=False):
             return
-        self._cancel_price_prefetch()
         server = self.server_combo.currentText().strip()
         country = self.country_input.text().strip()
         if server == "3" and not country:
@@ -404,77 +398,20 @@ class MainWindow(QMainWindow):
                     code = str(x.get("code", "")).strip()
                     name = str(x.get("name", "")).strip()
                     if code:
-                        p0 = x.get("price", x.get("cost", x.get("rate", "-")))
-                        ptxt = f"${p0}" if str(p0).strip() not in {"", "-", "None"} else "-"
-                        items.append({"label": f"{name} ({code})" if name else code, "code": code, "price": ptxt})
+                        items.append({"label": f"{name} ({code})" if name else code, "code": code, "price": "-"})
             elif server == "2":
                 for x in data if isinstance(data, list) else []:
                     sid = str(x.get("ID", "")).strip()
                     name = str(x.get("name", "")).strip()
                     if sid:
-                        p0 = x.get("price", x.get("cost", x.get("rate", "-")))
-                        ptxt = f"${p0}" if str(p0).strip() not in {"", "-", "None"} else "-"
-                        items.append({"label": f"{name} ({sid})" if name else sid, "code": sid, "price": ptxt})
+                        items.append({"label": f"{name} ({sid})" if name else sid, "code": sid, "price": "-"})
             else:
-                for key, val in data.items() if isinstance(data, dict) else []:
-                    p0 = val.get("price", val.get("cost", val.get("rate", "-"))) if isinstance(val, dict) else "-"
-                    ptxt = f"${p0}" if str(p0).strip() not in {"", "-", "None"} else "-"
-                    items.append({"label": str(key), "code": str(key), "price": ptxt})
+                for key in data.keys() if isinstance(data, dict) else []:
+                    items.append({"label": str(key), "code": str(key), "price": "-"})
 
             self.all_services = sorted(items, key=lambda z: z["label"].lower())
             self.apply_service_filter()
             self.log(f"Loaded {len(self.all_services)} services.")
-            self._start_price_prefetch()
-
-        self._run_bg(task, done)
-
-    def _cancel_price_prefetch(self):
-        self.price_prefetch_token += 1
-        self.price_prefetch_queue = []
-        self.price_prefetch_active = False
-
-    def _start_price_prefetch(self):
-        if not self._ensure_api(warn=False):
-            return
-        missing = [x["code"] for x in self.all_services if str(x.get("price", "-")).strip() in {"", "-"}]
-        if not missing:
-            return
-        self.price_prefetch_token += 1
-        token = self.price_prefetch_token
-        self.price_prefetch_queue = list(missing[:PRICE_PREFETCH_LIMIT])
-        self.price_prefetch_active = True
-        self.log(f"Prefetching prices for {len(self.price_prefetch_queue)} services...")
-        self._prefetch_next_price(token)
-
-    def _prefetch_next_price(self, token: int):
-        if not self.price_prefetch_active or token != self.price_prefetch_token:
-            return
-        if not self.price_prefetch_queue:
-            self.price_prefetch_active = False
-            self.log("Price prefetch done.")
-            return
-
-        service = self.price_prefetch_queue.pop(0)
-        server = self.server_combo.currentText().strip()
-        country = self.country_input.text().strip()
-
-        def task():
-            return self.api.get_price(server=server, service=service, country=country)
-
-        def done(resp):
-            if token != self.price_prefetch_token:
-                return
-            data = self._parse_json(resp)
-            if isinstance(data, dict) and str(data.get("status", "")).upper() == "SUCCESS":
-                ptxt = f"${str(data.get('price', '-'))}"
-                updated = False
-                for row in self.all_services:
-                    if row["code"] == service:
-                        row["price"] = ptxt
-                        updated = True
-                if updated:
-                    self.apply_service_filter()
-            QTimer.singleShot(PRICE_PREFETCH_INTERVAL_MS, lambda: self._prefetch_next_price(token))
 
         self._run_bg(task, done)
 
@@ -493,23 +430,25 @@ class MainWindow(QMainWindow):
             return
         row = self.filtered_services[row_idx]
         self.selected_service_code = row["code"]
-        self._update_selected_price(row)
 
-    def _update_selected_price(self, row):
+    def _load_order_cost(self, order_id: str, service: str):
         if not self._ensure_api(warn=False):
             return
         server = self.server_combo.currentText().strip()
         country = self.country_input.text().strip()
-        service = row["code"]
 
         def task():
             return self.api.get_price(server=server, service=service, country=country)
 
         def done(resp):
             data = self._parse_json(resp)
-            if isinstance(data, dict) and str(data.get("status", "")).upper() == "SUCCESS":
-                row["price"] = f"${str(data.get('price', '-'))}"
-                self.apply_service_filter()
+            if not (isinstance(data, dict) and str(data.get("status", "")).upper() == "SUCCESS"):
+                return
+            if order_id not in self.orders:
+                return
+            price = str(data.get("price", "-")).strip()
+            self.orders[order_id]["cost"] = f"${price}" if price else "-"
+            self._upsert_order_row(self.orders[order_id])
 
         self._run_bg(task, done)
 
@@ -649,6 +588,7 @@ class MainWindow(QMainWindow):
                         "created_ts": time.time(),
                     }
                     self._upsert_order_row(self.orders[oid])
+                    self._load_order_cost(oid, service)
             elif resp.startswith("HTTP_ERROR:429"):
                 self.log("Rate limited (429). API limit is 1 request each 2 seconds.")
 
