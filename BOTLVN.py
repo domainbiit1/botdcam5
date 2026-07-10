@@ -2714,6 +2714,54 @@ def auto_sl_tp_profile(signal):
     }
 
 
+def _retcode_name(code):
+    """Resolve MT5 TRADE_RETCODE_* constant name for readable logs."""
+    try:
+        iv = int(code)
+    except Exception:
+        return str(code)
+    for name in dir(mt5):
+        if not name.startswith("TRADE_RETCODE_"):
+            continue
+        try:
+            if int(getattr(mt5, name)) == iv:
+                return name
+        except Exception:
+            continue
+    return str(iv)
+
+
+def _fit_lot_to_margin(cfg, info, otype, price, lot):
+    """
+    Downsize lot to fit free margin before order_send.
+    Returns (lot_fit, required_margin, free_margin).
+    """
+    acc = mt5.account_info()
+    free_margin = float(getattr(acc, "margin_free", 0.0) or 0.0)
+    if free_margin <= 0:
+        return 0.0, None, free_margin
+
+    vol_min = float(getattr(info, "volume_min", 0.01) or 0.01)
+    vol_max = float(getattr(info, "volume_max", 100.0) or 100.0)
+    vol_step = float(getattr(info, "volume_step", 0.01) or 0.01)
+    lot_try = round_lot(min(max(float(lot), vol_min), vol_max), info)
+
+    best_need = None
+    # Decrease by volume_step until required margin is affordable.
+    for _ in range(600):
+        if lot_try < vol_min - 1e-12:
+            break
+        need = mt5.order_calc_margin(otype, cfg["symbol"], float(lot_try), float(price))
+        if need is not None:
+            best_need = float(need)
+            # Keep small safety headroom to reduce edge-case rejection.
+            if best_need <= free_margin * 0.985:
+                return float(lot_try), best_need, free_margin
+        lot_try = round_lot(float(lot_try) - vol_step, info)
+
+    return 0.0, best_need, free_margin
+
+
 def open_trade(cfg, side, signal):
     info = mt5.symbol_info(cfg["symbol"])
     tick = mt5.symbol_info_tick(cfg["symbol"])
@@ -2797,6 +2845,19 @@ def open_trade(cfg, side, signal):
     if lot <= 0:
         return False, "lot <= 0"
 
+    lot_fit, margin_need, margin_free = _fit_lot_to_margin(cfg, info, otype, price, lot)
+    if lot_fit <= 0:
+        return False, (
+            f"insufficient margin (ret=10019 likely) | lot={lot:.2f} "
+            f"need={float(margin_need or 0.0):.2f} free={margin_free:.2f}"
+        )
+    if lot_fit < lot:
+        log(
+            f"[RISK] lot reduced for margin: {lot:.2f} -> {lot_fit:.2f} "
+            f"(need~{float(margin_need or 0.0):.2f}, free~{margin_free:.2f})"
+        )
+        lot = lot_fit
+
     price = round(price, digits)
     sl = round(sl, digits)
     tp = round(tp, digits)
@@ -2854,8 +2915,9 @@ def open_trade(cfg, side, signal):
             res = mt5.order_send(req)
             if res is not None and getattr(res, "retcode", None) == mt5.TRADE_RETCODE_DONE:
                 break
+            rc = getattr(res, "retcode", None)
             attempts.append(
-                f"send fill={fm} {ctag} ret={getattr(res, 'retcode', None)} comment={getattr(res, 'comment', '')} last_error={mt5.last_error()}"
+                f"send fill={fm} {ctag} ret={rc}({_retcode_name(rc)}) comment={getattr(res, 'comment', '')} last_error={mt5.last_error()}"
             )
         if res is not None and getattr(res, "retcode", None) == mt5.TRADE_RETCODE_DONE:
             break
