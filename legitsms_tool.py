@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
 BASE_URL = "https://api.legitsms.com/api/handler/"
 POLL_INTERVAL_MS = 10000
 REFUND_DELAY_SEC = 120
+API_MIN_INTERVAL_MS = 2100
 
 
 class LegitSMSApi:
@@ -113,6 +114,9 @@ class MainWindow(QMainWindow):
         self.orders = {}
         self.order_row_map = {}
         self._bridges = []
+        self._api_queue = []
+        self._api_busy = False
+        self._last_api_call_ts = 0.0
         self.country_refresh_timer = QTimer(self)
         self.country_refresh_timer.setSingleShot(True)
         self.country_refresh_timer.timeout.connect(self.refresh_services)
@@ -171,7 +175,7 @@ class MainWindow(QMainWindow):
         row.addWidget(QLabel("Country"))
         self.country_combo = QComboBox()
         self.country_combo.setEditable(True)
-        self.country_combo.currentIndexChanged.connect(lambda _i: self.country_refresh_timer.start(250))
+        self.country_combo.currentIndexChanged.connect(lambda _i: self.country_refresh_timer.start(API_MIN_INTERVAL_MS))
         self.country_combo.lineEdit().returnPressed.connect(self.refresh_services)
         row.addWidget(self.country_combo)
         left_layout.addLayout(row)
@@ -323,6 +327,23 @@ class MainWindow(QMainWindow):
 
         bridge.done.connect(finish)
 
+        self._api_queue.append((fn, bridge))
+        self._pump_api_queue()
+
+    def _pump_api_queue(self):
+        if self._api_busy:
+            return
+        if not self._api_queue:
+            return
+        elapsed_ms = int((time.time() - self._last_api_call_ts) * 1000)
+        wait_ms = max(0, API_MIN_INTERVAL_MS - elapsed_ms)
+        if wait_ms > 0:
+            QTimer.singleShot(wait_ms, self._pump_api_queue)
+            return
+
+        fn, bridge = self._api_queue.pop(0)
+        self._api_busy = True
+
         def worker():
             try:
                 result = fn()
@@ -330,6 +351,12 @@ class MainWindow(QMainWindow):
                 result = f"WORKER_ERROR:{exc}"
             bridge.done.emit(result)
 
+        def release_queue(_result):
+            self._last_api_call_ts = time.time()
+            self._api_busy = False
+            self._pump_api_queue()
+
+        bridge.done.connect(release_queue)
         threading.Thread(target=worker, daemon=True).start()
 
     def _ensure_api(self, warn=True):
@@ -412,6 +439,10 @@ class MainWindow(QMainWindow):
             return self.api.get_countries(server=server)
 
         def done(resp):
+            if isinstance(resp, str) and resp.startswith("HTTP_ERROR:429"):
+                self.log("getCountries hit rate limit (429). Retrying in 2.1s...")
+                QTimer.singleShot(API_MIN_INTERVAL_MS, lambda: self.refresh_countries(then_refresh_services=then_refresh_services))
+                return
             data = self._parse_json(resp)
             if data is None:
                 self.log(f"getCountries raw: {resp}")
@@ -469,6 +500,10 @@ class MainWindow(QMainWindow):
             return self.api.get_services(server=server, country=country)
 
         def done(resp):
+            if isinstance(resp, str) and resp.startswith("HTTP_ERROR:429"):
+                self.log("getServices hit rate limit (429). Retrying in 2.1s...")
+                QTimer.singleShot(API_MIN_INTERVAL_MS, self.refresh_services)
+                return
             data = self._parse_json(resp)
             if data is None:
                 self.log(f"getServices raw: {resp}")
