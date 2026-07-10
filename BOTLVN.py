@@ -1554,7 +1554,7 @@ def compute_mode2_m1_scalp_signal(cfg):
             stop = abs(float(entry) - float(sl))
         if stop > float(MODE2_SL_MAX):
             # Keep difficult setups tradable by capping stop and reducing size.
-            if sid in ("trend_pullback", "orderflow_proxy", "session_scalp"):
+            if sid in ("orderflow_proxy", "session_scalp"):
                 cap_stop = float(MODE2_SL_MAX) * 0.98
                 sl = float(entry) - cap_stop if sig_side == "BUY" else float(entry) + cap_stop
                 stop = abs(float(entry) - float(sl))
@@ -1706,8 +1706,9 @@ def compute_mode2_m1_scalp_signal(cfg):
         # v15: transition-friendly trend gate with EMA20 slope + micro-structure support.
         buy_transition_ok = trend_buy_h1 and ema20_slope_up and hold_above_ema20 and (choch_up or (m15_slope_up and close >= ema20_now))
         sell_transition_ok = trend_sell_h1 and ema20_slope_dn and hold_below_ema20 and (choch_dn or (m15_slope_dn and close <= ema20_now))
-        buy_trend_ok = trend_buy_15 or buy_transition_ok or (m15_slope_up and close >= ema20_now)
-        sell_trend_ok = trend_sell_15 or sell_transition_ok or (m15_slope_dn and close <= ema20_now)
+        # Important: do NOT auto-enable Trend Pullback when market is flat.
+        buy_trend_ok = (trend_buy_15 or buy_transition_ok) and not trend_flat
+        sell_trend_ok = (trend_sell_15 or sell_transition_ok) and not trend_flat
         near_pull_buy = low <= float(ema20.iloc[i]) + 0.20 * a or low <= float(ema50.iloc[i]) + 0.16 * a or abs(close - support) <= 0.40 * a
         near_pull_sell = high >= float(ema20.iloc[i]) - 0.20 * a or high >= float(ema50.iloc[i]) - 0.16 * a or abs(close - resistance) <= 0.40 * a
         fast_buy = trend_buy and close > float(ema20.iloc[i]) and body >= 0.58 * rng and vol_now >= 1.05 * max(1.0, vol_avg) and rsi_now >= 47
@@ -1754,6 +1755,8 @@ def compute_mode2_m1_scalp_signal(cfg):
             build_trade("trend_pullback", "SELL", entry, sl, tp1, tp2, "momentum sell continuation từ vùng EMA20", "Hủy nếu nến M5 đóng lại trên EMA20", 7, 98, 4, 0.7)
         else:
             miss = []
+            if trend_flat:
+                miss.append("thị trường FLAT, bỏ qua Trend Pullback")
             if not (buy_trend_ok or sell_trend_ok):
                 miss.append("trend direction chưa đạt (M15/H1+EMA20 slope+micro break)")
             if buy_trend_ok and not near_pull_buy:
@@ -1890,8 +1893,8 @@ def compute_mode2_m1_scalp_signal(cfg):
         ema200_now = float(ema200.iloc[i])
         sideway_ok = (
             range_w_40 >= 1.2 * a
-            and range_w_40 <= 8.5 * a
-            and trend_strength < 0.85
+            and range_w_40 <= 9.0 * a
+            and trend_strength < 1.05
             and not (trend_buy and close > ema20_now + 0.2 * a)
             and not (trend_sell and close < ema20_now - 0.2 * a)
         )
@@ -1988,16 +1991,24 @@ def compute_mode2_m1_scalp_signal(cfg):
     if strat_on("orderflow_proxy"):
         micro_hi = float(df["high"].iloc[i - 6:i - 1].max())
         micro_lo = float(df["low"].iloc[i - 6:i - 1].min())
-        sweep_low = (low <= min(swing_lo, range_lo_20) + 0.02 * a) and close > min(swing_lo, range_lo_20)
-        sweep_high = (high >= max(swing_hi, range_hi_20) - 0.02 * a) and close < max(swing_hi, range_hi_20)
+        sweep_low = (
+            (low <= min(swing_lo, range_lo_20) + 0.02 * a)
+            and close > min(swing_lo, range_lo_20)
+            and (min(open_, close) - low) >= 0.25 * rng
+        )
+        sweep_high = (
+            (high >= max(swing_hi, range_hi_20) - 0.02 * a)
+            and close < max(swing_hi, range_hi_20)
+            and (high - max(open_, close)) >= 0.25 * rng
+        )
         choch_up = (sweep_low and close > micro_hi - 0.05 * a) or (
             close > micro_hi + 0.04 * a and prev_close <= micro_hi + 0.02 * a and body >= 0.38 * rng
         )
         choch_dn = (sweep_high and close < micro_lo + 0.05 * a) or (
             close < micro_lo - 0.04 * a and prev_close >= micro_lo - 0.02 * a and body >= 0.38 * rng
         )
-        flow_buy_ok = not (trend_sell and down_impulse)
-        flow_sell_ok = not (trend_buy and up_impulse)
+        flow_buy_ok = (trend_buy or trend_buy_15) and not trend_flat and not (trend_sell and down_impulse)
+        flow_sell_ok = (trend_sell or trend_sell_15) and not trend_flat and not (trend_buy and up_impulse)
         if choch_up and flow_buy_ok:
             entry = close
             sl = low - 0.12 * a
@@ -2028,8 +2039,10 @@ def compute_mode2_m1_scalp_signal(cfg):
                 miss.append("chưa có quét đỉnh/đáy")
             if not (choch_up or choch_dn):
                 miss.append("chưa có phá cấu trúc CHOCH")
+            if trend_flat:
+                miss.append("thị trường FLAT, bỏ qua Orderflow/CHOCH")
             if not flow_buy_ok or not flow_sell_ok:
-                miss.append("đang có impulse mạnh, giảm xác suất đảo chiều")
+                miss.append("đang có impulse mạnh/không đồng thuận trend")
             set_wait_status("orderflow_proxy", why_missing(miss, "NO TRADE | chưa có CHOCH rõ + retest"), buy_h=micro_hi, sell_h=micro_lo)
     else:
         set_wait_status("orderflow_proxy", "disabled")
