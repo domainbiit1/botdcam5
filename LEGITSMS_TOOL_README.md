@@ -2,8 +2,9 @@
 
 ## What this tool does
 - Enter your `api_key`
+- Auto-load service list based on selected server (`getServices`)
 - Buy a number (`getNumber`)
-- Automatically refresh SMS status every 3 seconds (`getStatus`)
+- Automatically refresh SMS status every 3 seconds (`getStatus`) without pressing Start
 - Cancel order (`setStatus=8`) or mark complete (`setStatus=6`)
 
 ## Run locally (Python)
